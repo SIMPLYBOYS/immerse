@@ -1,0 +1,683 @@
+// immerse — click a caption word, get an AI explanation of it in context; A/S/D to move by
+// sentence; Z for a Chinese line. Isolated world, no build step.
+// hook.js (MAIN world) supplies the player's signed timedtext URL; bg.js makes the Claude call.
+
+const SEG = ".ytp-caption-segment";
+const BOX = "#ytp-caption-window-container";
+const WORD = /[A-Za-z][A-Za-z'’-]*/;
+// A sentence ends only when the punctuation is followed by space/end, so "llama.cpp" stays whole.
+// ponytail: "3.5" mid-number can still false-close one. Rare enough to eat.
+const SENTENCE = /^([\s\S]*?[.!?]+)(\s+|$)/;
+
+// Closed word classes: the full membership is short and fixed, so a lookup table is exact and
+// free. Only verbs and nouns are open-ended enough to need the model.
+const set = (s) => new Set(s.split(" "));
+const PREP = set(`about above across after against along among around as at before behind below
+  beneath beside between beyond by down during except for from in inside into near of off on onto
+  out outside over past since through throughout to toward towards under until up upon with within
+  without`.split(/\s+/).filter(Boolean).join(" "));
+const AUX = set("am is are was were be been being have has had do does did will would shall should can could may might must");
+const DET = set("a an the this that these those my your his her its our their some any each every no");
+const PRON = set("i you he she it we they me him us them who whom whose which what");
+const CONJ = set("and but or nor so yet because although though while if unless whereas than");
+
+// `learned` is the model's word→verb/noun map; undefined means "leave it neutral".
+function posOf(word, learned) {
+  const w = word.toLowerCase();
+  if (AUX.has(w)) return "aux";
+  if (PREP.has(w)) return "prep";
+  if (DET.has(w)) return "det";
+  if (PRON.has(w)) return "pron";
+  if (CONJ.has(w)) return "conj";
+  if (!learned) return undefined;
+  if (learned[w]) return learned[w];
+  // The model still answers with base forms sometimes, so try the obvious endings before giving
+  // up. ponytail: a naive stemmer, not a lemmatiser — irregulars like "grew"→"grow" stay unmatched.
+  // A real one means npm and a bundler, which this project does not have.
+  // Each ending is its own candidate: an alternation would let /(es|s)$/ eat "sees" down to "se".
+  // A wrong stem is harmless because only an exact hit in the map is accepted.
+  for (const stem of [
+    w.replace(/ies$/, "y"), // stories → story
+    w.replace(/s$/, ""), // sees → see
+    w.replace(/es$/, ""), // watches → watch
+    w.replace(/ed$/, ""), // opened → open
+    w.replace(/ing$/, ""), // talking → talk
+    w.replace(/ing$/, "e"), // making → make
+    w.replace(/([bdgklmnprt])\1(ing|ed)$/, "$1"), // running → run, stopped → stop
+  ]) {
+    if (stem !== w && learned[stem]) return learned[stem];
+  }
+  return undefined;
+}
+
+// The model answers in a line format rather than prose so the popup can lay it out: the
+// in-context meaning first, then a few general senses each with an example and its translation.
+// Malformed lines are dropped rather than rendered, so a bad reply degrades to less content
+// instead of a broken panel.
+function parseReply(text) {
+  const senses = [];
+  let context = "";
+  let zh = "";
+  for (const line of String(text ?? "").split("\n")) {
+    const l = line.trim();
+    if (l.startsWith("CONTEXT:")) context = l.slice(8).trim();
+    else if (l.startsWith("ZH:")) zh = l.slice(3).trim();
+    else if (l.startsWith("SENSE:")) {
+      // Not named `zh`: that one is the whole sentence's translation, this is the example's.
+      const [pos, gloss, example, egzh] = l.slice(6).split("|").map((p) => p.trim());
+      if (pos && gloss) senses.push({ pos, gloss, example, zh: egzh });
+    }
+  }
+  // A reply that ignored the format entirely is still worth showing as plain text.
+  return { context: context || (senses.length ? "" : String(text ?? "").trim()), zh, senses };
+}
+
+// zeroStudy's own guidance: no more than ten marks per hour of immersion. Past that the reviews
+// pile up faster than they can be cleared and the deck stops being reviewable at all.
+const MARKS_PER_HOUR = 10;
+
+// Marks are stamped with the immersion clock rather than wall-clock time, so a week away from
+// YouTube doesn't reset the budget and a binge doesn't get a free pass.
+function markRate(words, immSec, windowSec = 3600) {
+  return words.filter((w) => w.atSec != null && w.atSec > immSec - windowSec).length;
+}
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const bounded = (word, flags) =>
+  new RegExp(`(?<![A-Za-z'’-])${escapeRe(word)}(?![A-Za-z'’-])`, flags);
+
+// Case-insensitive, whole-word search: "grew into" must not match inside "grown into".
+function indexOfWord(text, phrase) {
+  const m = text.match(bounded(phrase, "i"));
+  return m ? m.index : -1;
+}
+
+// Cut `text` into runs, marking the stretches that are known multi-word expressions so they can
+// be rendered as one clickable unit. Idioms and phrasal verbs are exactly what an advanced
+// learner misses, and boxing each word separately hides them.
+function splitPhrases(text, phrases = []) {
+  const out = [];
+  let rest = text;
+  while (rest) {
+    let best = null;
+    for (const p of phrases) {
+      const at = indexOfWord(rest, p);
+      // Earliest match wins; on a tie the longer phrase does, so "look forward to" beats
+      // "look forward".
+      if (at >= 0 && (!best || at < best.at || (at === best.at && p.length > best.p.length))) {
+        best = { at, p };
+      }
+    }
+    if (!best) {
+      out.push({ text: rest });
+      break;
+    }
+    out.push({ text: rest.slice(0, best.at) });
+    out.push({ text: rest.slice(best.at, best.at + best.p.length), phrase: true });
+    rest = rest.slice(best.at + best.p.length);
+  }
+  return out.filter((run) => run.text);
+}
+
+// Stitch the timed cues into sentences. Cues break mid-sentence ("...like Qwen, Kimmy, and the" /
+// "GLM family are..."), so the text is concatenated and re-split on punctuation. Each sentence
+// keeps the start time of the cue it began in — that is what A/S/D seeks to.
+function toSentences(cues) {
+  const out = [];
+  let buf = "";
+  let start = null;
+  for (const c of cues) {
+    if (start === null) start = c.start;
+    buf = buf ? `${buf} ${c.text}` : c.text;
+    let m;
+    while ((m = buf.match(SENTENCE))) {
+      out.push({ text: m[1].trim(), start });
+      buf = buf.slice(m[0].length);
+      // Anything left over began inside this cue; if nothing is left, the next sentence starts
+      // in whichever cue comes next — not this one.
+      start = buf.trim() ? c.start : null;
+    }
+  }
+  if (buf.trim()) out.push({ text: buf.trim(), start });
+  // A sentence runs until the next one starts, which makes "which sentence is playing" a lookup.
+  out.forEach((s, k) => (s.end = out[k + 1]?.start ?? Infinity));
+  return out;
+}
+
+function start_() {
+  const state = { captures: [], open: null, marks: {}, zhOn: false,
+    trackUrl: null, cues: [], sentences: [], zhCues: [], phrases: [], pos: {} };
+  window.__im = state;
+
+  chrome.storage.local.get(["marks", "zhOn", "immersion"]).then((r) => {
+    state.marks = r.marks ?? {};
+    state.zhOn = !!r.zhOn;
+    state.imm = r.immersion ?? 0;
+    state.immSaved = state.imm;
+    repaint();
+  });
+
+  // Immersion clock: seconds of video actually playing in a visible tab. Flushed every 15s rather
+  // than every tick — a storage write per second would be absurd for a counter nobody watches.
+  function tickImmersion() {
+    const v = video();
+    if (v && !v.paused && !v.ended && !document.hidden) state.imm += 1;
+    if (state.imm - state.immSaved >= 15) {
+      const delta = state.imm - state.immSaved;
+      state.immSaved = state.imm;
+      // ponytail: read-modify-write, so two YouTube tabs open at once can lose a few seconds.
+      chrome.storage.local
+        .get("immersion")
+        .then(({ immersion = 0 }) => chrome.storage.local.set({ immersion: immersion + delta }));
+    }
+  }
+
+  // sendMessage reports a dead service worker through lastError, not through the reply — without
+  // this the failure arrives as a bare `undefined` and looks like an empty answer.
+  const ask = (payload) =>
+    new Promise((ok) =>
+      chrome.runtime.sendMessage(payload, (r) =>
+        ok(chrome.runtime.lastError ? { error: chrome.runtime.lastError.message } : r),
+      ),
+    );
+  const video = () => document.querySelector("video");
+
+  // --- transcript -----------------------------------------------------------------------------
+  // The same signed URL with tlang= returns YouTube's own translation, so the Chinese line costs
+  // no API call. Same origin as the page, so no CORS problem.
+  async function fetchCues(url, tlang) {
+    const u = new URL(url, location.origin);
+    u.searchParams.set("fmt", "json3");
+    if (tlang) u.searchParams.set("tlang", tlang);
+    const r = await fetch(u);
+    if (!r.ok) return [];
+    const json = await r.json().catch(() => null);
+    return (json?.events ?? [])
+      .filter((e) => e.segs)
+      .map((e) => ({
+        start: e.tStartMs / 1000,
+        text: e.segs.map((s) => s.utf8).join("").replace(/\s+/g, " ").trim(),
+      }))
+      .filter((c) => c.text);
+  }
+
+  async function loadTrack() {
+    const url = document.documentElement.dataset.imTimedtext;
+    if (!url || url === state.trackUrl) return; // also re-fires on SPA navigation to a new video
+    state.trackUrl = url;
+    state.zhCues = [];
+    state.phrases = [];
+    state.pos = {};
+    state.cues = await fetchCues(url);
+    state.sentences = toSentences(state.cues);
+    if (state.zhOn) state.zhCues = await fetchCues(url, "zh-Hant");
+    console.log("[immerse]", state.sentences.length, "sentences from", state.cues.length, "cues");
+    loadPhrases();
+    loadPos();
+  }
+
+  // Same batch-once-per-video shape as loadPhrases. Untagged words simply render neutral, so a
+  // partial or missing answer degrades quietly instead of breaking the captions.
+  async function loadPos() {
+    const key = `pos3_${new URLSearchParams(location.search).get("v")}`;
+    const full = state.sentences.map((s) => s.text).join(" ");
+    const head = full.slice(0, 80);
+    const hit = (await chrome.storage.local.get(key))[key];
+    const cached = hit?.head === head ? hit.raw : undefined;
+    const res = cached !== undefined ? { text: cached } : await ask({ type: "pos", text: full });
+    if (!res || res.error) return console.warn("[immerse] pos failed:", res?.error ?? "no reply");
+    const raw = res.text ?? "";
+    state.pos = Object.fromEntries(
+      raw
+        .split("\n")
+        .map((l) => l.trim().split(/\s+/))
+        .filter(([w, tag]) => w && ["verb", "noun", "adj"].includes(tag))
+        .map(([w, tag]) => [w.toLowerCase(), tag]),
+    );
+    if (!cached && Object.keys(state.pos).length) chrome.storage.local.set({ [key]: { raw, head } });
+    console.log("[immerse]", Object.keys(state.pos).length, "words tagged");
+    repaint();
+  }
+
+  // One call per video, not per sentence — the transcript goes over whole and comes back as a
+  // list. Cached per video so a page reload doesn't pay for it again.
+  async function loadPhrases() {
+    const videoId = new URLSearchParams(location.search).get("v");
+    // The prefix is the prompt version: bump it and every cached answer is re-asked, since a
+    // stored list from an older prompt is exactly as wrong as a stale one.
+    const key = `ph3_${videoId}`;
+    const full = state.sentences.map((s) => s.text).join(" ");
+    // A cache entry is only trusted if it was written for this exact transcript. SPA navigation
+    // leaves the previous video's timedtext URL on <html> for a tick, so a videoId alone is not
+    // proof the stored answer belongs to the text we are about to match against.
+    const head = full.slice(0, 80);
+    const hit = (await chrome.storage.local.get(key))[key];
+    const cached = hit?.head === head ? hit.raw : undefined;
+    const res = cached !== undefined ? { text: cached } : await ask({ type: "phrases", text: full });
+    // Don't let an API failure turn into "0 phrases" — that looks identical to a working
+    // extension that simply found nothing, which is why this state is reported in the popup.
+    if (!res || res.error) {
+      state.phraseNote = `phrases failed: ${res?.error ?? "no reply from the worker"}`;
+      return console.warn("[immerse]", state.phraseNote);
+    }
+    const raw = res.text ?? "";
+    // Keep only expressions that really occur in this transcript. A hallucinated phrase simply
+    // won't match, which makes this line the entire verification step.
+    state.phrases = raw
+      .split("\n")
+      // Strip list markers the model adds despite being told not to; "- grew into" would never
+      // match the transcript and would be silently dropped.
+      .map((p) => p.trim().replace(/^[-*•–]+\s*|^\d+[.)]\s*/, "").trim())
+      .filter((p) => p.includes(" ") && indexOfWord(full, p) >= 0);
+    if (!cached && state.phrases.length) chrome.storage.local.set({ [key]: { raw, head } });
+    state.phraseNote = state.phrases.length
+      ? `${state.phrases.length} phrases: ${state.phrases.slice(0, 4).join(" / ")}`
+      : // Nothing matched: show both sides so a wrong-transcript case is obvious at a glance.
+        `0 matched | sent "${head.slice(0, 50)}…" | got ${raw.replace(/\n/g, " / ").slice(0, 90) || "(empty)"}`;
+    console.log("[immerse]", state.phraseNote, state.phrases);
+    repaint();
+  }
+
+  const playing = () => {
+    const t = video()?.currentTime ?? 0;
+    return state.sentences.findIndex((s) => t >= s.start && t < s.end);
+  };
+
+  // The caption on screen lags the clock by up to a cue, so trust the word over the timestamp.
+  function sentenceFor(word) {
+    const k = playing();
+    if (k < 0) return null;
+    const re = bounded(word);
+    for (const j of [k, k - 1, k + 1]) {
+      if (state.sentences[j] && re.test(state.sentences[j].text)) return state.sentences[j];
+    }
+    return state.sentences[k];
+  }
+
+  function seek(delta) {
+    const v = video();
+    if (!v || !state.sentences.length) return;
+    const k = Math.max(0, playing());
+    const target = state.sentences[Math.min(state.sentences.length - 1, Math.max(0, k + delta))];
+    if (target) v.currentTime = target.start;
+  }
+
+  // --- clickable caption words ----------------------------------------------------------------
+  function wrap(seg) {
+    const text = seg.textContent;
+    if (seg.dataset.imText === text) return;
+    seg.textContent = "";
+    seg.appendChild(tokenSpans(text));
+    seg.dataset.imText = seg.textContent;
+  }
+
+  // Colour each word by part of speech. A phrase chip stays a single click target but shows its
+  // verb and particle separately — seeing "grew" and "into" in different colours inside one box
+  // is the whole point of grouping it.
+  function posSpans(text) {
+    return text
+      .split(/(\s+)/)
+      .filter(Boolean)
+      .map((tok) => {
+        const w = tok.match(WORD);
+        if (!w) return document.createTextNode(tok);
+        const s = document.createElement("span");
+        const p = posOf(w[0], state.pos);
+        if (p) s.className = `im-${p}`;
+        s.textContent = tok;
+        return s;
+      });
+  }
+
+  function chip(display, word, isPhrase) {
+    const el = document.createElement("span");
+    const how = state.marks[word.toLowerCase()]; // marks are case-insensitive
+    el.className = ["im-w", isPhrase && "im-phrase", how && `im-${how}`].filter(Boolean).join(" ");
+    el.append(...posSpans(display)); // keeps the comma; dataset holds the clean word
+    el.dataset.imWord = word;
+    return el;
+  }
+
+  function tokenSpans(text) {
+    const frag = document.createDocumentFragment();
+    // ponytail: a caption line can cut a phrase in half; that one just renders as separate
+    // words rather than being tracked across segments.
+    for (const run of splitPhrases(text, state.phrases)) {
+      if (run.phrase) {
+        frag.appendChild(chip(run.text, run.text, true));
+        continue;
+      }
+      for (const tok of run.text.split(/(\s+)/)) {
+        if (!tok) continue;
+        const w = tok.match(WORD);
+        if (!w) frag.appendChild(document.createTextNode(tok));
+        else frag.appendChild(chip(tok, w[0]));
+      }
+    }
+    return frag;
+  }
+
+  // wrap() skips a segment whose text it already handled, so a colour change needs the memo cleared.
+  function repaint() {
+    document.querySelectorAll(SEG).forEach((s) => {
+      delete s.dataset.imText;
+      wrap(s);
+    });
+  }
+
+  function tick() {
+    document.querySelectorAll(SEG).forEach(wrap);
+    paintZh();
+  }
+
+  function capture(el) {
+    const word = el.dataset.imWord;
+    const videoId = new URLSearchParams(location.search).get("v");
+    const t = +(video()?.currentTime ?? 0).toFixed(2);
+    const s = sentenceFor(word);
+    const item = { id: `${videoId}:${t}:${word}`, word, videoId, t, sentence: s?.text ?? null,
+      context: "", senses: [], done: false };
+    state.captures.push(item);
+    state.open = { item, el };
+    freeze(); // keyboard or programmatic clicks never went through the hover path
+    if (!s) {
+      Object.assign(item, { context: "(no transcript yet — turn captions on and reload)", done: true });
+      render();
+      return;
+    }
+    render();
+    ask({ type: "explain", word, sentence: s.text }).then((r) => {
+      Object.assign(item, parseReply(r?.text ?? r?.error ?? "(no reply)"), { done: true });
+      render();
+      console.log("[immerse]", item);
+    });
+  }
+
+  // The deck is only ever changed by pressing 學習中 / 已掌握. Clicking a word is curiosity, not
+  // a commitment to memorise it — auto-saving every click filled the review queue with noise.
+  // Keyed on the lowercased word, so meeting the same word in a second video updates one entry
+  // rather than creating a duplicate card.
+  async function deck(item, how) {
+    const { words = [] } = await chrome.storage.local.get("words");
+    const id = item.word.toLowerCase();
+    const at = words.findIndex((w) => w.id === id);
+    if (!how) {
+      if (at >= 0) words.splice(at, 1);
+    } else {
+      const row = {
+        atSec: state.imm, // only set on first add; the spread below keeps an existing stamp
+        ...(at >= 0 ? words[at] : {}), // keep whatever scheduling the card already has
+        id,
+        word: item.word,
+        context: item.context,
+        senses: item.senses,
+        sentence: item.sentence,
+        zh: item.zh,
+        videoId: item.videoId,
+        title: document.title.replace(/ - YouTube$/, ""),
+        t: item.t,
+        suspended: how === "known", // 已掌握 stays in the library but off the review queue
+      };
+      if (at >= 0) words[at] = row;
+      else words.push(row);
+    }
+    await chrome.storage.local.set({ words });
+    return words;
+  }
+
+  async function mark(item, how) {
+    const k = item.word.toLowerCase();
+    const clearing = state.marks[k] === how; // pressing the same button again removes it entirely
+    if (clearing) delete state.marks[k];
+    else state.marks[k] = how;
+    chrome.storage.local.set({ marks: state.marks });
+    repaint();
+    render();
+    const words = await deck(item, clearing ? null : how);
+    const n = markRate(words, state.imm);
+    // A warning, not a block: it is your call, but an unclearable backlog is the failure mode.
+    state.markNote =
+      n > MARKS_PER_HOUR ? `本小時已標記 ${n} 個，建議 ≤ ${MARKS_PER_HOUR}，標太多會複習不完` : "";
+    render();
+  }
+
+  // --- Chinese line ---------------------------------------------------------------------------
+  async function toggleZh() {
+    state.zhOn = !state.zhOn;
+    chrome.storage.local.set({ zhOn: state.zhOn });
+    if (state.zhOn && !state.zhCues.length && state.trackUrl) {
+      state.zhCues = await fetchCues(state.trackUrl, "zh-Hant");
+    }
+    paintZh();
+  }
+
+  function paintZh() {
+    let el = document.getElementById("im-zh");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "im-zh";
+      document.body.appendChild(el);
+    }
+    const segs = document.querySelectorAll(SEG);
+    const s = state.sentences[playing()];
+    if (!state.zhOn || !s || !segs.length) {
+      el.style.display = "none";
+      return;
+    }
+    // The Chinese track is segmented differently from the English one (332 cues vs 168), so it is
+    // matched by time window rather than paired by index.
+    el.textContent = state.zhCues
+      .filter((c) => c.start >= s.start && c.start < s.end)
+      .map((c) => c.text)
+      .join("");
+    const first = segs[0].getBoundingClientRect();
+    const last = segs[segs.length - 1].getBoundingClientRect();
+    el.style.display = el.textContent ? "block" : "none";
+    el.style.left = `${first.left}px`;
+    el.style.top = `${last.bottom + 4}px`;
+  }
+
+  // --- popup ----------------------------------------------------------------------------------
+  function line(text, cls) {
+    const el = document.createElement("div");
+    el.className = cls;
+    el.textContent = text; // never innerHTML — this is API text
+    return el;
+  }
+
+  // Web Speech API: no key, no network, no cost — the teardown found zeroStudy uses the same.
+  const say = (text) =>
+    speechSynthesis.speak(Object.assign(new SpeechSynthesisUtterance(text), { lang: "en-US" }));
+
+  function head(word) {
+    const el = document.createElement("div");
+    el.className = "im-head";
+    el.append(word, " ");
+    const b = document.createElement("button");
+    b.textContent = "🔊";
+    b.title = "pronounce";
+    b.addEventListener("click", () => say(word));
+    el.appendChild(b);
+    return el;
+  }
+
+  function sense(s) {
+    const el = document.createElement("div");
+    el.className = "im-sense";
+    el.append(line(s.pos, "im-pos"), line(s.gloss, "im-gloss"));
+    if (s.example) el.appendChild(line(s.example, "im-eg"));
+    if (s.zh) el.appendChild(line(s.zh, "im-egzh"));
+    return el;
+  }
+
+  function buttons(item) {
+    const row = document.createElement("div");
+    row.className = "im-btns";
+    for (const [how, label] of [["learning", "學習中"], ["known", "已掌握"]]) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (state.marks[item.word.toLowerCase()] === how) b.className = "on";
+      b.addEventListener("click", () => mark(item, how));
+      row.appendChild(b);
+    }
+    return row;
+  }
+
+  function render() {
+    let box = document.getElementById("im-pop");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "im-pop";
+      box.addEventListener("click", (e) => e.stopPropagation());
+      document.body.appendChild(box);
+    }
+    if (!state.open) {
+      box.style.display = "none";
+      return;
+    }
+    const { item, el } = state.open;
+    box.replaceChildren(
+      head(item.word),
+      line(item.done ? item.context : "…", "im-ai"),
+      ...item.senses.map(sense),
+      line(item.sentence ?? "", "im-sent"),
+      buttons(item),
+      ...(state.markNote ? [line(state.markNote, "im-warn")] : []),
+      line(state.phraseNote ?? "…finding phrases", "im-note"),
+    );
+    const r = el.getBoundingClientRect();
+    box.style.display = "block";
+    box.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 380))}px`;
+    box.style.bottom = `${innerHeight - r.top + 8}px`;
+  }
+
+  // Hovering a word freezes the caption so it can be clicked at all — by the time you decide,
+  // a live caption has already moved on. Only ever un-pause a video we paused ourselves, so a
+  // manually paused video stays put.
+  const freeze = () => {
+    const v = video();
+    if (v && !v.paused) {
+      v.pause();
+      state.pausedByUs = true;
+    }
+  };
+
+  const thaw = () => {
+    if (!state.pausedByUs || state.open) return; // popup still open: they are reading
+    state.pausedByUs = false;
+    video()?.play();
+  };
+
+  const hide = () => {
+    state.open = null;
+    render();
+    thaw();
+  };
+
+  function onWord(e) {
+    const el = e.target.closest?.(".im-w");
+    if (!el) {
+      if (e.type === "click" && !e.target.closest?.("#im-pop")) hide();
+      return;
+    }
+    // A press that moved is YouTube repositioning its caption box. Swallowing pointerdown used to
+    // kill that drag outright, so only the click is intercepted and a moved pointer is left alone.
+    if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return;
+    e.stopPropagation(); // the player toggles play/pause on click; that decision is ours
+    e.preventDefault();
+    if (e.type === "click") capture(el);
+  }
+
+  let down = null;
+  document.addEventListener("pointerdown", (e) => (down = { x: e.clientX, y: e.clientY }), true);
+  for (const type of ["click", "dblclick"]) document.addEventListener(type, onWord, true);
+
+  // mouseover/mouseout bubble, unlike mouseenter/mouseleave — needed because the word spans are
+  // rebuilt several times a second and nothing can stay bound to them.
+  document.addEventListener("mouseover", (e) => e.target.closest?.(".im-w") && freeze(), true);
+  document.addEventListener(
+    "mouseout",
+    (e) => {
+      if (!e.target.closest?.(".im-w")) return;
+      if (e.relatedTarget?.closest?.(".im-w, #im-pop")) return; // moving to another word or the popup
+      thaw();
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key === "Escape") return hide();
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+      const focused = document.activeElement;
+      // Don't hijack the search box or a comment field.
+      if (focused && (focused.isContentEditable || /input|textarea/i.test(focused.tagName))) return;
+      const act = { a: () => seek(-1), s: () => seek(0), d: () => seek(1), z: toggleZh }[
+        e.key.toLowerCase()
+      ];
+      if (!act) return;
+      e.preventDefault();
+      e.stopPropagation();
+      act();
+    },
+    true,
+  );
+
+  document.head.appendChild(document.createElement("style")).textContent = `
+    /* Every word gets an outline so it reads as clickable; marked ones override the colour. */
+    .im-w{pointer-events:auto;cursor:pointer;border-radius:5px;padding:0 3px;
+      box-shadow:inset 0 0 0 1px #ffffff40}
+    .im-w:hover{background:#fc0;color:#000;box-shadow:inset 0 0 0 1px #fc0}
+    /* content words bright, function words dim, particles loud — that contrast is what makes a
+       phrasal verb visible at a glance */
+    .im-verb{color:#7fd1ff}
+    .im-noun{color:#ffd479}
+    .im-adj{color:#b9f5a0}
+    .im-prep{color:#ff7ab6}
+    .im-aux,.im-det,.im-pron,.im-conj{color:#9aa}
+    .im-phrase{box-shadow:inset 0 0 0 2px #fc0a}
+    .im-learning{box-shadow:inset 0 0 0 2px #4af}
+    .im-known{box-shadow:inset 0 0 0 2px #4c8}
+    #im-zh{position:fixed;z-index:99998;max-width:80vw;padding:2px 8px;background:#000a;color:#fff;
+      border-radius:4px;font:20px/1.4 -apple-system,system-ui,sans-serif;pointer-events:none}
+    #im-pop{position:fixed;z-index:99999;width:360px;max-height:60vh;overflow:auto;
+      padding:12px 14px;background:#111e;color:#eee;border-radius:8px;
+      font:13px/1.55 -apple-system,system-ui,sans-serif;box-shadow:0 6px 24px #0008}
+    #im-pop .im-head{font-size:16px;font-weight:600;color:#fc0;margin-bottom:6px}
+    #im-pop .im-head button{background:none;border:0;cursor:pointer;font-size:14px;padding:0}
+    #im-pop .im-ai{white-space:pre-wrap}
+    #im-pop .im-sense{margin-top:10px;padding-left:9px;border-left:2px solid #444}
+    #im-pop .im-pos{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#ff7ab6}
+    #im-pop .im-gloss{color:#eee}
+    #im-pop .im-eg{margin-top:3px;color:#bbb}
+    #im-pop .im-egzh{color:#888;font-size:12px}
+    #im-pop .im-sent{margin-top:8px;font-size:11px;color:#777;font-style:italic}
+    #im-pop .im-warn{margin-top:10px;padding:6px 8px;border-radius:6px;font-size:12px;
+      background:#4a3a10;color:#fc0}
+    #im-pop .im-note{margin-top:8px;font-size:10px;color:#666}
+    #im-pop .im-btns{margin-top:10px;display:flex;gap:8px}
+    #im-pop .im-btns button{flex:1;padding:5px;font:inherit;cursor:pointer;
+      border:1px solid #555;border-radius:5px;background:#222;color:#ccc}
+    #im-pop .im-btns button.on{background:#4af;border-color:#4af;color:#000}`;
+
+  // The caption container is created/destroyed as CC toggles, so re-attach when it changes.
+  const obs = new MutationObserver(tick);
+  let box = null;
+  setInterval(() => {
+    const cur = document.querySelector(BOX);
+    if (cur && cur !== box) {
+      obs.disconnect();
+      obs.observe(cur, { childList: true, subtree: true, characterData: true });
+      box = cur;
+    }
+    tick();
+    tickImmersion();
+    loadTrack();
+  }, 1000);
+
+  state.saved = () => chrome.storage.local.get("words").then((r) => r.words ?? []);
+}
+
+if (typeof document !== "undefined") start_();
+if (typeof module !== "undefined") module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate };

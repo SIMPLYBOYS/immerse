@@ -1,0 +1,127 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>immerse — 記憶固化</title>
+<style>
+  :root { --line: #e8e8e8; --dim: #888 }
+  body { font: 15px/1.7 -apple-system, system-ui, sans-serif; margin: 0 auto; padding: 40px 24px;
+         max-width: 720px; color: #1a1a1a; background: #fafafa }
+  h1 { font-size: 22px; margin: 0 0 4px; text-align: center }
+  #headline { text-align: center; color: var(--dim); margin: 0 0 16px }
+  .pills { display: flex; gap: 10px; justify-content: center; margin-bottom: 28px }
+  .pills span { font-size: 13px; padding: 5px 14px; border-radius: 999px; background: #fff;
+                border: 1px solid var(--line) }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px }
+  .panel { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 18px }
+  .panel h2 { font-size: 13px; margin: 0 0 12px; color: #555; font-weight: 600 }
+  #retention { font-size: 32px; font-weight: 600 }
+  .rate { font-size: 12px; color: var(--dim); margin-left: 6px }
+  .row { display: flex; justify-content: space-between; font-size: 13px; margin-top: 12px }
+  .track { height: 6px; border-radius: 3px; background: #eee; margin-top: 4px }
+  .track div { height: 100%; border-radius: 3px }
+  #barLearning { background: #4a7dff }
+  #barKnown { background: #3fbf7f }
+  #forecast { display: flex; align-items: flex-end; gap: 10px; height: 78px }
+  #forecast .col { flex: 1; display: flex; flex-direction: column; align-items: center;
+                   justify-content: flex-end; gap: 4px }
+  #forecast .bar { width: 100%; background: #3fbf7f; border-radius: 3px; min-height: 2px }
+  #forecast .n { font-size: 11px; color: var(--dim) }
+  #forecast .d { font-size: 11px; color: var(--dim) }
+  button { font: inherit; padding: 10px 18px; border: 1px solid #ccc; border-radius: 8px;
+           background: #fff; cursor: pointer }
+  #start { width: 100%; background: #111; color: #fff; border-color: #111; padding: 15px;
+           font-size: 16px; border-radius: 12px }
+  #start:disabled { background: #eee; color: #999; border-color: #eee; cursor: default }
+  h3 { font-size: 14px; margin: 32px 0 12px }
+  #videos { display: grid; grid-template-columns: 1fr 1fr; gap: 12px }
+  .vcard { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px;
+           cursor: pointer }
+  .vcard.done { cursor: default; opacity: .6 }
+  .vtitle { font-size: 13px; font-weight: 600; line-height: 1.4; margin-bottom: 8px }
+  .vdue { font-size: 11px; padding: 3px 9px; border-radius: 999px; background: #fff2e0; color: #b26a00 }
+  .vcard.done .vdue { background: #e9f7ee; color: #2f7d51 }
+  .vtrack { height: 5px; border-radius: 3px; background: #eee; margin: 10px 0 6px }
+  .vfill { height: 100%; border-radius: 3px; background: #3fbf7f }
+  .vmeta { font-size: 11px; color: var(--dim) }
+  #card { background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 26px 30px }
+  #chead { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--dim) }
+  #chead a { color: inherit; text-decoration: none }
+  #stamp { background: #f0f0f0; border-radius: 5px; padding: 1px 7px; font-size: 12px }
+  #chead label { margin-left: auto; display: flex; align-items: center; gap: 6px; cursor: pointer }
+  #skip, #quit { padding: 4px 10px; font-size: 12px; color: var(--dim); border-radius: 6px }
+  #front { font-size: 34px; font-weight: 700; text-align: center; margin: 34px 0 22px }
+  #front button, #ctx button { background: none; border: 0; cursor: pointer; font-size: 17px;
+                               padding: 0 4px; vertical-align: middle }
+  #ctx { text-align: center; font-size: 18px; color: #444; line-height: 2 }
+  #ctx .hit { background: #e8efff; box-shadow: inset 0 0 0 1.5px #4a7dff; border-radius: 6px;
+              padding: 3px 5px }
+  #zhrow { text-align: center; margin-top: 14px }
+  #showzh { border: 0; background: none; color: var(--dim); font-size: 13px; text-decoration: underline }
+  #zh { color: #555; font-size: 15px }
+  .sense { white-space: pre-wrap; border-left: 2px solid var(--line); padding-left: 10px; margin: 12px 0 }
+  #back { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 18px }
+  #link { display: block; margin-top: 8px; font-size: 13px }
+  #grades { display: flex; gap: 12px; margin-top: 26px; justify-content: center }
+  #grades button { min-width: 150px; padding: 12px }
+  #again { color: #c0392b; border-color: #eccac4 }
+  kbd { font-size: 11px; color: #aaa }
+  .hint { font-size: 12px; color: var(--dim); margin-top: 28px }
+  #clear { font-size: 12px; padding: 5px 12px; color: #a33; border-color: #e5c5c5 }
+</style>
+
+<section id="home">
+  <h1>記憶固化</h1>
+  <p id="headline"></p>
+  <div class="pills"><span id="streak"></span><span id="today"></span><span id="imm"></span></div>
+
+  <div class="cards">
+    <div class="panel">
+      <h2>⚡ 記憶效能</h2>
+      <div><span id="retention">—</span><span class="rate">記憶率</span></div>
+      <div class="row"><span>學習中</span><b id="learning">0</b></div>
+      <div class="track"><div id="barLearning"></div></div>
+      <div class="row"><span>已掌握</span><b id="known">0</b></div>
+      <div class="track"><div id="barKnown"></div></div>
+    </div>
+    <div class="panel">
+      <h2>🌱 複習預報</h2>
+      <div id="forecast"></div>
+    </div>
+  </div>
+
+  <button id="start">今天沒有待複習</button>
+
+  <h3>按影片複習</h3>
+  <div id="videos"></div>
+
+  <p class="hint">詞彙只在你於影片上按下「學習中」或「已掌握」時才進到這裡；點字查詢不會加入。</p>
+  <button id="clear">清空詞彙庫</button>
+</section>
+
+<section id="card" hidden>
+  <div id="chead">
+    <a id="vlink" target="_blank">▶ <span id="vtitle"></span></a>
+    <span id="stamp"></span>
+    <label><input type="checkbox" id="recall" /> 主動回憶</label>
+    <span id="left"></span>
+    <button id="skip" title="稍後再看這張，不影響排程">跳過 <kbd>→</kbd></button>
+    <button id="quit" title="離開複習">✕ <kbd>esc</kbd></button>
+  </div>
+
+  <div id="front"></div>
+  <div id="ctx"></div>
+  <div id="zhrow"><button id="showzh">顯示翻譯</button><div id="zh" hidden></div></div>
+
+  <div id="back" hidden>
+    <p id="context"></p>
+    <div id="senses"></div>
+    <a id="link" target="_blank"></a>
+  </div>
+
+  <div id="grades">
+    <button id="reveal">顯示解釋 <kbd>space</kbd></button>
+    <button id="again">再來一次 <kbd>1</kbd></button>
+    <button id="got">記住了 <kbd>2</kbd></button>
+  </div>
+</section>
+
+<script src="review.js"></script>

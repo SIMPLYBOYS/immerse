@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>immerse</title>
+<style>
+  body { font: 14px/1.6 -apple-system, system-ui, sans-serif; padding: 24px; max-width: 460px }
+  input { width: 100%; padding: 8px; font: inherit; box-sizing: border-box }
+  button { margin-top: 10px; padding: 6px 16px; font: inherit }
+  p { color: #666 }
+  h3 { margin-top: 32px }
+  #msg { margin-left: 10px; color: #0a0 }
+  #count { color: #666 }
+  table { border-collapse: collapse; width: 100%; font-size: 13px }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid #eee }
+  th:first-child, td:first-child { text-align: left }
+  th { color: #888; font-weight: 500 }
+  tr.sum td { font-weight: 600; border-bottom: 0 }
+  #resetUsage { font-size: 12px; padding: 5px 12px }
+</style>
+<h2>immerse</h2>
+<form id="f">
+  <label for="key">Anthropic API key</label>
+  <input id="key" type="password" placeholder="sk-ant-..." autocomplete="off" />
+  <button>Save</button><span id="msg"></span>
+</form>
+<p>Stored in <code>chrome.storage.local</code> in the clear — anything that can read this Chrome
+profile can read the key.</p>
+
+<h3>LLM 用量</h3>
+<p>模型 <code id="model">—</code>，自 <span id="since">—</span> 起累計。</p>
+<table>
+  <thead><tr><th>用途</th><th>次數</th><th>輸入</th><th>輸出</th><th>估計花費</th></tr></thead>
+  <tbody id="usage"></tbody>
+</table>
+<p id="nomodel" hidden>這個模型沒有價格資料，只顯示 token 數。改模型時要一併更新
+<code>options.js</code> 的 <code>PRICES</code>。</p>
+<button id="resetUsage">歸零</button>
+
+<h3>Export</h3>
+<p id="count">…</p>
+<button id="export">Export CSV</button>
+<p>Five columns: word, what it meant in context, the general senses with example sentences, the
+sentence it came from, and a link back to that moment in the video. In Anki:
+<em>File → Import</em>, separator <strong>comma</strong>, map column 1 to Front and the rest to
+whichever fields your note type has.</p>
+<script src="options.js"></script>
