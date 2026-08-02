@@ -57,10 +57,13 @@ function posOf(word, learned) {
 function parseReply(text) {
   const senses = [];
   let context = "";
+  let contextZh = "";
   let zh = "";
   for (const line of String(text ?? "").split("\n")) {
     const l = line.trim();
-    if (l.startsWith("CONTEXT:")) context = l.slice(8).trim();
+    // CONTEXT_ZH before CONTEXT: the longer prefix has to win, or it is swallowed by the shorter.
+    if (l.startsWith("CONTEXT_ZH:")) contextZh = l.slice(11).trim();
+    else if (l.startsWith("CONTEXT:")) context = l.slice(8).trim();
     else if (l.startsWith("ZH:")) zh = l.slice(3).trim();
     else if (l.startsWith("SENSE:")) {
       // Not named `zh`: that one is the whole sentence's translation, this is the example's.
@@ -69,7 +72,12 @@ function parseReply(text) {
     }
   }
   // A reply that ignored the format entirely is still worth showing as plain text.
-  return { context: context || (senses.length ? "" : String(text ?? "").trim()), zh, senses };
+  return {
+    context: context || (senses.length ? "" : String(text ?? "").trim()),
+    contextZh,
+    zh,
+    senses,
+  };
 }
 
 // zeroStudy's own guidance: no more than ten marks per hour of immersion. Past that the reviews
@@ -149,14 +157,6 @@ function start_() {
     trackUrl: null, cues: [], sentences: [], zhCues: [], phrases: [], pos: {} };
   window.__im = state;
 
-  chrome.storage.local.get(["marks", "zhOn", "immersion"]).then((r) => {
-    state.marks = r.marks ?? {};
-    state.zhOn = !!r.zhOn;
-    state.imm = r.immersion ?? 0;
-    state.immSaved = state.imm;
-    repaint();
-  });
-
   // Immersion clock: seconds of video actually playing in a visible tab. Flushed every 15s rather
   // than every tick — a storage write per second would be absurd for a counter nobody watches.
   function tickImmersion() {
@@ -165,21 +165,52 @@ function start_() {
     if (state.imm - state.immSaved >= 15) {
       const delta = state.imm - state.immSaved;
       state.immSaved = state.imm;
+      // Two shapes on purpose: `immersion` is a monotonic clock the mark-rate budget measures
+      // against, `immLog` is per-day and is what the daily goal reads.
+      const day = new Date();
+      const key = `${day.getFullYear()}-${day.getMonth() + 1}-${day.getDate()}`;
       // ponytail: read-modify-write, so two YouTube tabs open at once can lose a few seconds.
-      chrome.storage.local
-        .get("immersion")
-        .then(({ immersion = 0 }) => chrome.storage.local.set({ immersion: immersion + delta }));
+      getStore(["immersion", "immLog"]).then(({ immersion = 0, immLog = {} }) => {
+        immLog[key] = (immLog[key] ?? 0) + delta;
+        setStore({ immersion: immersion + delta, immLog });
+      });
     }
   }
+
+  // Reloading the extension orphans this script: chrome.* is still there but every call throws
+  // "Extension context invalidated". chrome.runtime.id going undefined is the signal — but the
+  // invalidation is not atomic, so a storage call can throw while the id still reads fine. Every
+  // chrome.* call therefore goes through safe(), which swallows both the synchronous throw from
+  // the call itself and the rejection of the promise it returns.
+  const alive = () => !!chrome.runtime?.id;
+  const safe = (fn, fallback) => {
+    try {
+      return Promise.resolve(fn()).catch(() => fallback);
+    } catch {
+      return Promise.resolve(fallback);
+    }
+  };
+  // Named getStore/setStore, not get/set: `set` is already the word-class Set builder above.
+  const getStore = (keys, fallback = {}) => safe(() => chrome.storage.local.get(keys), fallback);
+  const setStore = (obj) => safe(() => chrome.storage.local.set(obj), undefined);
+
+  getStore(["marks", "zhOn", "immersion"]).then((r) => {
+    state.marks = r.marks ?? {};
+    state.zhOn = !!r.zhOn;
+    state.imm = r.immersion ?? 0;
+    state.immSaved = state.imm;
+    repaint();
+  });
 
   // sendMessage reports a dead service worker through lastError, not through the reply — without
   // this the failure arrives as a bare `undefined` and looks like an empty answer.
   const ask = (payload) =>
-    new Promise((ok) =>
+    new Promise((ok) => {
+      if (!alive()) return ok({ error: "擴充剛重新載入，請重新整理這個分頁" });
       chrome.runtime.sendMessage(payload, (r) =>
         ok(chrome.runtime.lastError ? { error: chrome.runtime.lastError.message } : r),
-      ),
-    );
+      );
+    });
   const video = () => document.querySelector("video");
 
   // --- transcript -----------------------------------------------------------------------------
@@ -222,7 +253,7 @@ function start_() {
     const key = `pos3_${new URLSearchParams(location.search).get("v")}`;
     const full = state.sentences.map((s) => s.text).join(" ");
     const head = full.slice(0, 80);
-    const hit = (await chrome.storage.local.get(key))[key];
+    const hit = (await getStore(key))[key];
     const cached = hit?.head === head ? hit.raw : undefined;
     const res = cached !== undefined ? { text: cached } : await ask({ type: "pos", text: full });
     if (!res || res.error) return console.warn("[immerse] pos failed:", res?.error ?? "no reply");
@@ -234,7 +265,7 @@ function start_() {
         .filter(([w, tag]) => w && ["verb", "noun", "adj"].includes(tag))
         .map(([w, tag]) => [w.toLowerCase(), tag]),
     );
-    if (!cached && Object.keys(state.pos).length) chrome.storage.local.set({ [key]: { raw, head } });
+    if (!cached && Object.keys(state.pos).length) setStore({ [key]: { raw, head } });
     console.log("[immerse]", Object.keys(state.pos).length, "words tagged");
     repaint();
   }
@@ -251,7 +282,7 @@ function start_() {
     // leaves the previous video's timedtext URL on <html> for a tick, so a videoId alone is not
     // proof the stored answer belongs to the text we are about to match against.
     const head = full.slice(0, 80);
-    const hit = (await chrome.storage.local.get(key))[key];
+    const hit = (await getStore(key))[key];
     const cached = hit?.head === head ? hit.raw : undefined;
     const res = cached !== undefined ? { text: cached } : await ask({ type: "phrases", text: full });
     // Don't let an API failure turn into "0 phrases" — that looks identical to a working
@@ -269,7 +300,7 @@ function start_() {
       // match the transcript and would be silently dropped.
       .map((p) => p.trim().replace(/^[-*•–]+\s*|^\d+[.)]\s*/, "").trim())
       .filter((p) => p.includes(" ") && indexOfWord(full, p) >= 0);
-    if (!cached && state.phrases.length) chrome.storage.local.set({ [key]: { raw, head } });
+    if (!cached && state.phrases.length) setStore({ [key]: { raw, head } });
     state.phraseNote = state.phrases.length
       ? `${state.phrases.length} phrases: ${state.phrases.slice(0, 4).join(" / ")}`
       : // Nothing matched: show both sides so a wrong-transcript case is obvious at a glance.
@@ -398,7 +429,7 @@ function start_() {
   // Keyed on the lowercased word, so meeting the same word in a second video updates one entry
   // rather than creating a duplicate card.
   async function deck(item, how) {
-    const { words = [] } = await chrome.storage.local.get("words");
+    const { words = [] } = await getStore("words");
     const id = item.word.toLowerCase();
     const at = words.findIndex((w) => w.id === id);
     if (!how) {
@@ -410,6 +441,7 @@ function start_() {
         id,
         word: item.word,
         context: item.context,
+        contextZh: item.contextZh,
         senses: item.senses,
         sentence: item.sentence,
         zh: item.zh,
@@ -417,20 +449,25 @@ function start_() {
         title: document.title.replace(/ - YouTube$/, ""),
         t: item.t,
         suspended: how === "known", // 已掌握 stays in the library but off the review queue
+        knownAt: how === "known" ? Date.now() : undefined, // for the "mastered this week" count
       };
       if (at >= 0) words[at] = row;
       else words.push(row);
     }
-    await chrome.storage.local.set({ words });
+    await setStore({ words });
     return words;
   }
 
   async function mark(item, how) {
+    if (!alive()) {
+      state.markNote = "擴充剛重新載入，請重新整理這個分頁後再標記";
+      return render();
+    }
     const k = item.word.toLowerCase();
     const clearing = state.marks[k] === how; // pressing the same button again removes it entirely
     if (clearing) delete state.marks[k];
     else state.marks[k] = how;
-    chrome.storage.local.set({ marks: state.marks });
+    setStore({ marks: state.marks });
     repaint();
     render();
     const words = await deck(item, clearing ? null : how);
@@ -444,7 +481,7 @@ function start_() {
   // --- Chinese line ---------------------------------------------------------------------------
   async function toggleZh() {
     state.zhOn = !state.zhOn;
-    chrome.storage.local.set({ zhOn: state.zhOn });
+    setStore({ zhOn: state.zhOn });
     if (state.zhOn && !state.zhCues.length && state.trackUrl) {
       state.zhCues = await fetchCues(state.trackUrl, "zh-Hant");
     }
@@ -538,7 +575,9 @@ function start_() {
     const { item, el } = state.open;
     box.replaceChildren(
       head(item.word),
-      line(item.done ? item.context : "…", "im-ai"),
+      // Chinese first — it is the line that unblocks you. English stays underneath as input.
+      line(item.done ? item.contextZh || item.context : "…", "im-ai"),
+      ...(item.contextZh && item.context ? [line(item.context, "im-ai-en")] : []),
       ...item.senses.map(sense),
       line(item.sentence ?? "", "im-sent"),
       buttons(item),
@@ -647,6 +686,7 @@ function start_() {
     #im-pop .im-head{font-size:16px;font-weight:600;color:#fc0;margin-bottom:6px}
     #im-pop .im-head button{background:none;border:0;cursor:pointer;font-size:14px;padding:0}
     #im-pop .im-ai{white-space:pre-wrap}
+    #im-pop .im-ai-en{white-space:pre-wrap;margin-top:8px;font-size:12px;color:#9a9a9a}
     #im-pop .im-sense{margin-top:10px;padding-left:9px;border-left:2px solid #444}
     #im-pop .im-pos{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#ff7ab6}
     #im-pop .im-gloss{color:#eee}
@@ -664,7 +704,13 @@ function start_() {
   // The caption container is created/destroyed as CC toggles, so re-attach when it changes.
   const obs = new MutationObserver(tick);
   let box = null;
-  setInterval(() => {
+  const timer = setInterval(() => {
+    // An orphaned script would otherwise keep throwing once a second until the tab is closed.
+    if (!alive()) {
+      clearInterval(timer);
+      obs.disconnect();
+      return;
+    }
     const cur = document.querySelector(BOX);
     if (cur && cur !== box) {
       obs.disconnect();
@@ -676,7 +722,7 @@ function start_() {
     loadTrack();
   }, 1000);
 
-  state.saved = () => chrome.storage.local.get("words").then((r) => r.words ?? []);
+  state.saved = () => getStore("words").then((r) => r.words ?? []);
 }
 
 if (typeof document !== "undefined") start_();

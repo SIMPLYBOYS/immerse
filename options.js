@@ -25,6 +25,7 @@ const toCsv = (rows) => rows.map((r) => r.map(csvCell).join(",")).join("\n");
 const rowsFor = (words) =>
   words.map((w) => [
     w.word,
+    w.contextZh ?? "",
     w.context ?? "",
     (w.senses ?? []).map((s) => `${s.pos} ${s.gloss}｜${s.example ?? ""}｜${s.zh ?? ""}`).join("\n"),
     w.sentence ?? "",

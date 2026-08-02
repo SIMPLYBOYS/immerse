@@ -3,9 +3,14 @@ const { toSentences, splitPhrases, posOf, parseReply, markRate } = require("./co
 
 // --- parseReply ---
 const reply = parseReply(`CONTEXT: "Grew into" means developed into something larger.
+CONTEXT_ZH: 「grew into」在這裡是「發展成為」的意思。
+ZH: 它從一個業餘專案發展成基礎。
 SENSE: v. | 發展成為 | It grew into a giant. | 它發展成一家巨頭。
 SENSE: v. | 長大到穿得下 | He grew into his brother's coat. | 他長大到穿得下他哥的外套。`);
 assert.equal(reply.context, '"Grew into" means developed into something larger.');
+// CONTEXT_ZH must not be eaten by the shorter CONTEXT prefix
+assert.equal(reply.contextZh, "「grew into」在這裡是「發展成為」的意思。");
+assert.equal(reply.zh, "它從一個業餘專案發展成基礎。");
 assert.equal(reply.senses.length, 2);
 assert.deepEqual(reply.senses[0], {
   pos: "v.",
@@ -18,8 +23,8 @@ assert.equal(parseReply("CONTEXT: x\nSENSE: v.").senses.length, 0);
 // a reply that ignored the format entirely still shows up as plain text
 assert.equal(parseReply("just a sentence").context, "just a sentence");
 const { toCsv, rowsFor, totals, costOf, money } = require("./options.js");
-const { schedule, stats, forecast, isDue, urgency, buildQueue, streakOf, byVideo, markTarget } =
-  require("./review.js");
+const { schedule, stats, forecast, isDue, urgency, buildQueue, streakOf, byVideo, markTarget,
+  todayMins, masteredSince, GOAL_MIN } = require("./review.js");
 
 // --- SM-2 ---
 const T0 = 1_700_000_000_000;
@@ -90,6 +95,19 @@ assert.equal(streakOf({ [key(today)]: 3, [key(yesterday)]: 1 }, T0), 2);
 assert.equal(streakOf({ [key(yesterday)]: 1, [key(twoAgo)]: 1 }, T0), 2);
 assert.equal(streakOf({}, T0), 0);
 
+// --- daily immersion goal ---
+const G = GOAL_MIN * 60;
+// the streak counts days that reached the goal, and a short day breaks it
+assert.equal(streakOf({ [key(today)]: G, [key(yesterday)]: G }, T0, G), 2);
+assert.equal(streakOf({ [key(today)]: G, [key(yesterday)]: 60 }, T0, G), 1);
+// not having reached today's goal yet must not zero a streak that is still alive
+assert.equal(streakOf({ [key(yesterday)]: G, [key(twoAgo)]: G }, T0, G), 2);
+
+assert.equal(todayMins({ [key(today)]: 1830 }, T0), 30); // seconds → whole minutes
+assert.equal(todayMins({}, T0), 0);
+
+assert.equal(masteredSince([{ knownAt: T0 - DAY }, { knownAt: T0 - 30 * DAY }, {}], T0 - 7 * DAY), 1);
+
 assert.deepEqual(
   byVideo([{ videoId: "a", title: "A" }, { videoId: "b" }, { videoId: "a", title: "A" }]).map(
     (g) => [g.title, g.words.length],
@@ -111,6 +129,7 @@ assert.deepEqual(
   rowsFor([
     {
       word: "grew into",
+      contextZh: "中文解釋…",
       context: "means…",
       senses: [{ pos: "v.", gloss: "發展成為", example: "It grew into a giant.", zh: "它發展成巨頭。" }],
       sentence: "It grew into…",
@@ -121,6 +140,7 @@ assert.deepEqual(
   [
     [
       "grew into",
+      "中文解釋…",
       "means…",
       "v. 發展成為｜It grew into a giant.｜它發展成巨頭。",
       "It grew into…",
@@ -241,3 +261,9 @@ assert.equal(money(null), "—");
 assert.equal(money(0.0004), "< $0.01");
 assert.equal(money(1.239), "$1.24");
 assert.deepEqual(totals({}), { calls: 0, in: 0, out: 0 });
+
+// The pure functions above are only half the risk. start_() never runs in Node, so a load-time
+// error (a const used before its declaration, a missing global) sails past every assertion here.
+require("child_process").execFileSync(process.execPath, [__dirname + "/smoke.js"], {
+  stdio: "inherit",
+});

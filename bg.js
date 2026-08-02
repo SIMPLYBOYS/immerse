@@ -14,6 +14,8 @@ Reply in exactly this shape and nothing else:
 CONTEXT: what the word means in THIS sentence. At most 3 short sentences, under 50 words. If it \
 belongs to an idiom or phrasal verb, name the whole expression and explain that instead — that is \
 usually the part worth learning.
+CONTEXT_ZH: the same explanation in 繁體中文, one line. Not a word-for-word translation of the \
+English line — write it the way you would explain it to a Chinese speaker.
 ZH: the whole given sentence translated into 繁體中文, one line.
 SENSE: <pos> | <繁體中文語意> | <short English example sentence> | <該例句的繁體中文翻譯>
 

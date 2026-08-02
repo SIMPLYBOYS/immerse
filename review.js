@@ -78,13 +78,19 @@ const forecast = (words, now = Date.now()) =>
         .length,
   );
 
-// Not having studied *yet today* must not zero a streak that is still alive.
-function streakOf(log, now = Date.now()) {
+// Consecutive days whose entry reaches `min`. Not having reached it *yet today* must not zero a
+// streak that is still alive — otherwise every morning starts at zero.
+function streakOf(log, now = Date.now(), min = 1) {
+  const hit = (t) => (log[dayKey(t)] ?? 0) >= min;
   let n = 0;
-  let i = log[dayKey(now)] ? 0 : 1;
-  for (; log[dayKey(now - i * DAY)]; i++) n++;
+  let i = hit(now) ? 0 : 1;
+  for (; hit(now - i * DAY); i++) n++;
   return n;
 }
+
+const GOAL_MIN = 30; // zeroStudy's default daily immersion target
+const todayMins = (immLog, now = Date.now()) => Math.floor((immLog[dayKey(now)] ?? 0) / 60);
+const masteredSince = (words, since) => words.filter((w) => (w.knownAt ?? 0) >= since).length;
 
 // Split a sentence around the target so the card can highlight it in place. Recall works from the
 // phrase as it was heard, in its own sentence — a bare headword tests recognition, not retrieval.
@@ -125,6 +131,7 @@ function wire() {
   let queue = [];
   let card = null;
   let immersion = 0;
+  let immLog = {};
   let total = 0;
   let done = 0;
 
@@ -136,10 +143,18 @@ function wire() {
       : words.length
         ? "今天沒有待複習的詞彙。"
         : "詞彙庫是空的。在影片上按「學習中」把詞加進來。";
-    $("streak").textContent = `🔥 ${streakOf(log, now)} 天連續學習`;
+    // The streak that matters is the immersion habit, not the reviewing — reviewing follows it.
+    const mins = todayMins(immLog, now);
+    $("goalMins").textContent = mins;
+    $("goalOf").textContent = `${mins} / ${GOAL_MIN} mins`;
+    $("goalBar").style.width = `${Math.min(100, (mins / GOAL_MIN) * 100)}%`;
+    $("goalHint").textContent =
+      mins >= GOAL_MIN ? "今天已達標" : `再 ${GOAL_MIN - mins} 分鐘即可達成目標`;
+    $("goalStreak").textContent = `🔥 連續達標 ${streakOf(immLog, now, GOAL_MIN * 60)} 天`;
     $("today").textContent = `✓ 今日複習 ${log[dayKey(now)] ?? 0} 詞`;
     // The denominator of the ten-marks-per-hour rule, so the warning in the popup has a meaning.
-    $("imm").textContent = `⏱ 沉浸 ${Math.floor(immersion / 3600)}h ${Math.floor((immersion % 3600) / 60)}m`;
+    $("imm").textContent = `⏱ 累計沉浸 ${Math.floor(immersion / 3600)}h ${Math.floor((immersion % 3600) / 60)}m`;
+    $("weekKnown").textContent = masteredSince(words, now - 7 * DAY);
     $("retention").textContent = s.retention === null ? "—" : `${s.retention}%`;
     $("learning").textContent = s.learning;
     $("known").textContent = s.known;
@@ -239,6 +254,7 @@ function wire() {
     $("reveal").hidden = true;
     $("back").hidden = false;
     $("front").replaceChildren(card.word, speaker(card.word)); // recall mode: the answer, at last
+    $("contextZh").textContent = card.contextZh ?? "";
     $("context").textContent = card.context ?? "";
     $("senses").replaceChildren(
       ...(card.senses ?? []).map((s) =>
@@ -261,10 +277,11 @@ function wire() {
     next();
   }
 
-  chrome.storage.local.get(["words", "log", "recall", "immersion"]).then((r) => {
+  chrome.storage.local.get(["words", "log", "recall", "immersion", "immLog"]).then((r) => {
     words = r.words ?? [];
     log = r.log ?? {};
     immersion = r.immersion ?? 0;
+    immLog = r.immLog ?? {};
     $("recall").checked = !!r.recall;
     paint();
   });
@@ -321,4 +338,5 @@ function wire() {
 
 if (typeof document !== "undefined") wire();
 if (typeof module !== "undefined")
-  module.exports = { schedule, stats, forecast, isDue, urgency, buildQueue, streakOf, byVideo, markTarget };
+  module.exports = { schedule, stats, forecast, isDue, urgency, buildQueue, streakOf, byVideo,
+    markTarget, todayMins, masteredSince, GOAL_MIN };
