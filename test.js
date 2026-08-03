@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor } = require("./content.js");
+const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl } = require("./content.js");
 
 // --- parseReply ---
 const reply = parseReply(`CONTEXT: "Grew into" means developed into something larger.
@@ -397,4 +397,13 @@ assert.equal(zhFor(zh, { start: 4.5, end: 6 }), "第二句，");
 // the last sentence has end = Infinity and must still find its cue
 assert.equal(zhFor(zh, { start: 9, end: Infinity }), "接續。");
 assert.equal(zhFor([], { start: 0, end: 5 }), ""); // no zh track at all: empty, not a crash
+
+// --- cueUrl: the player may itself be on an auto-translated track ---
+const stashed = "https://www.youtube.com/api/timedtext?v=abc&pot=SIG&tlang=zh-Hant&lang=en";
+// base fetch strips the player's tlang — the English pipeline must never run on translated text
+assert.equal(cueUrl(stashed).searchParams.get("tlang"), null);
+assert.equal(cueUrl(stashed).searchParams.get("pot"), "SIG"); // the signature survives untouched
+assert.equal(cueUrl(stashed).searchParams.get("fmt"), "json3");
+// the zh fetch re-adds exactly the language it wants
+assert.equal(cueUrl(stashed, "zh-Hant").searchParams.get("tlang"), "zh-Hant");
 

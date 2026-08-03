@@ -172,6 +172,18 @@ function zhFor(zhCues, s) {
   return cues.map((c) => c.text).join("");
 }
 
+// Build the timedtext URL for a fetch. The stashed URL may already carry tlang=… — when the
+// player itself is displaying an auto-translated track — and must be stripped, or the "English"
+// pipeline (sentences, phrases, POS) silently runs on the translated text. YouTube renders one
+// track at a time; both languages at once is exactly what the Z line exists for.
+function cueUrl(url, tlang) {
+  const u = new URL(url, "https://www.youtube.com");
+  u.searchParams.set("fmt", "json3");
+  u.searchParams.delete("tlang");
+  if (tlang) u.searchParams.set("tlang", tlang);
+  return u;
+}
+
 function start_() {
   const state = { captures: [], open: null, marks: {}, zhOn: false, blurOn: false,
     trackUrl: null, cues: [], sentences: [], zhCues: [], phrases: [], pos: {} };
@@ -258,10 +270,7 @@ function start_() {
   // The same signed URL with tlang= returns YouTube's own translation, so the Chinese line costs
   // no API call. Same origin as the page, so no CORS problem.
   async function fetchCues(url, tlang) {
-    const u = new URL(url, location.origin);
-    u.searchParams.set("fmt", "json3");
-    if (tlang) u.searchParams.set("tlang", tlang);
-    const r = await fetch(u);
+    const r = await fetch(cueUrl(url, tlang));
     if (!r.ok) return [];
     const json = await r.json().catch(() => null);
     const list = (json?.events ?? [])
@@ -284,6 +293,8 @@ function start_() {
     // trackUrl is deliberately left unset so the real watch page re-evaluates from scratch.
     if (!new URLSearchParams(location.search).get("v")) return;
     state.trackUrl = url;
+    // Remember whether the on-screen captions are a translated track, to hint the user below.
+    state.translatedTrack = url.includes("tlang=");
     state.zhCues = [];
     state.phrases = [];
     state.pos = {};
@@ -556,11 +567,21 @@ function start_() {
     }
     const segs = document.querySelectorAll(SEG);
     const s = state.sentences[playing()];
-    if (!state.zhOn || !s || !segs.length) {
+    if (!segs.length) {
       el.style.display = "none";
       return;
     }
-    const text = zhFor(state.zhCues, s);
+    let text;
+    if (state.translatedTrack) {
+      // The captions on screen are Chinese already — clicking them queries garbage, and a zh
+      // line under a zh track helps nobody. Say what to do instead of failing quietly.
+      text = "YouTube 字幕是自動翻譯軌——請切回英文原文，中文對照改按 Z 顯示";
+    } else if (state.zhOn && s) {
+      text = zhFor(state.zhCues, s);
+    } else {
+      el.style.display = "none";
+      return;
+    }
     // Both writes are guarded: our own MutationObserver watches this subtree, and an
     // unconditional append/textContent every tick would be a mutation loop.
     const win = segs[segs.length - 1].closest(".caption-window");
@@ -787,4 +808,4 @@ function start_() {
 }
 
 if (typeof document !== "undefined") start_();
-if (typeof module !== "undefined") module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor };
+if (typeof module !== "undefined") module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl };
