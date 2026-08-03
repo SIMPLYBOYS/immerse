@@ -84,12 +84,13 @@ function parseReply(text) {
 // pile up faster than they can be cleared and the deck stops being reviewable at all.
 const MARKS_PER_HOUR = 10;
 
-// Marks are stamped with the immersion clock rather than wall-clock time, so a week away from
-// YouTube doesn't reset the budget and a binge doesn't get a free pass. Only 學習中 counts:
+// A plain wall-clock hour. This originally ran on the immersion clock ("an hour of watching"),
+// which meant marks from yesterday still filled the window after a 10-hour break — technically
+// consistent, practically absurd for an advisory cap on a personal tool. Only 學習中 counts:
 // the cap exists to protect the review queue, and a word marked 已掌握 never enters it.
-function markRate(words, immSec, windowSec = 3600) {
+function markRate(words, now, windowMs = 3600_000) {
   return words.filter(
-    (w) => !w.suspended && w.atSec != null && w.atSec > immSec - windowSec,
+    (w) => !w.suspended && w.addedAt != null && w.addedAt > now - windowMs,
   ).length;
 }
 
@@ -153,6 +154,22 @@ function toSentences(cues) {
   // A sentence runs until the next one starts, which makes "which sentence is playing" a lookup.
   out.forEach((s, k) => (s.end = out[k + 1]?.start ?? Infinity));
   return out;
+}
+
+// Which zh cues translate sentence `s`. The zh track is segmented differently from the English
+// one (a cue often straddles two sentences), so cues are assigned to the sentence their MIDPOINT
+// falls in — the old "starts inside the window" test returned nothing for a short sentence whose
+// translation cue began a beat early, and the line silently vanished. If no midpoint lands in the
+// window (very short sentence), fall back to whichever cue is playing at the sentence's centre.
+function zhFor(zhCues, s) {
+  const mid = (c) => (c.end === Infinity ? c.start : (c.start + (c.end ?? c.start)) / 2);
+  let cues = zhCues.filter((c) => mid(c) >= s.start && mid(c) < s.end);
+  if (!cues.length) {
+    const horizon = s.end === Infinity ? s.start + 15 : s.end;
+    const centre = (s.start + horizon) / 2;
+    cues = zhCues.filter((c) => c.start <= centre && centre < (c.end ?? Infinity));
+  }
+  return cues.map((c) => c.text).join("");
 }
 
 function start_() {
@@ -247,18 +264,25 @@ function start_() {
     const r = await fetch(u);
     if (!r.ok) return [];
     const json = await r.json().catch(() => null);
-    return (json?.events ?? [])
+    const list = (json?.events ?? [])
       .filter((e) => e.segs)
       .map((e) => ({
         start: e.tStartMs / 1000,
         text: e.segs.map((s) => s.utf8).join("").replace(/\s+/g, " ").trim(),
       }))
       .filter((c) => c.text);
+    // Each cue runs until the next one starts — zhFor needs midpoints, which need ends.
+    list.forEach((c, i) => (c.end = list[i + 1]?.start ?? Infinity));
+    return list;
   }
 
   async function loadTrack() {
     const url = document.documentElement.dataset.imTimedtext;
     if (!url || url === state.trackUrl) return; // also re-fires on SPA navigation to a new video
+    // No video id means a homepage/preview player fired this request. There is nothing to study
+    // and no cache key to file under — and hover-previews must not burn phrase/POS calls.
+    // trackUrl is deliberately left unset so the real watch page re-evaluates from scratch.
+    if (!new URLSearchParams(location.search).get("v")) return;
     state.trackUrl = url;
     state.zhCues = [];
     state.phrases = [];
@@ -267,6 +291,10 @@ function start_() {
     state.sentences = toSentences(state.cues);
     if (state.zhOn) state.zhCues = await fetchCues(url, "zh-Hant");
     console.log("[immerse]", state.sentences.length, "sentences from", state.cues.length, "cues");
+    // Homepage preview players fire timedtext requests too, and those often yield no usable
+    // cues — an empty transcript must never reach the model (the API rejects empty content,
+    // and there is nothing to ask about anyway).
+    if (!state.sentences.length) return;
     loadPhrases();
     loadPos();
   }
@@ -460,8 +488,7 @@ function start_() {
       if (at >= 0) words.splice(at, 1);
     } else {
       const row = {
-        atSec: state.imm, // only set on first add; the spread below keeps an existing stamp
-        addedAt: Date.now(), // ditto — the date it entered the deck, for the weekly count
+        addedAt: Date.now(), // only set on first add; the spread below keeps an existing stamp
         ...(at >= 0 ? words[at] : {}), // keep whatever scheduling the card already has
         id,
         word: item.word,
@@ -496,12 +523,11 @@ function start_() {
     repaint();
     render();
     const words = await deck(item, clearing ? null : how);
-    const n = markRate(words, state.imm);
+    const n = markRate(words, Date.now());
     // A warning, not a block: it is your call, but an unclearable backlog is the failure mode.
-    // "近一小時沉浸", not "本小時" — the window is an hour of watch time, not a wall-clock hour.
     state.markNote =
       n > MARKS_PER_HOUR
-        ? `近一小時沉浸已標記 ${n} 個學習中，建議 ≤ ${MARKS_PER_HOUR}，標太多會複習不完`
+        ? `近一小時已標記 ${n} 個學習中，建議 ≤ ${MARKS_PER_HOUR}，標太多會複習不完`
         : "";
     render();
   }
@@ -534,12 +560,7 @@ function start_() {
       el.style.display = "none";
       return;
     }
-    // The Chinese track is segmented differently from the English one (332 cues vs 168), so it is
-    // matched by time window rather than paired by index.
-    const text = state.zhCues
-      .filter((c) => c.start >= s.start && c.start < s.end)
-      .map((c) => c.text)
-      .join("");
+    const text = zhFor(state.zhCues, s);
     // Both writes are guarded: our own MutationObserver watches this subtree, and an
     // unconditional append/textContent every tick would be a mutation loop.
     const win = segs[segs.length - 1].closest(".caption-window");
@@ -766,4 +787,4 @@ function start_() {
 }
 
 if (typeof document !== "undefined") start_();
-if (typeof module !== "undefined") module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate };
+if (typeof module !== "undefined") module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor };

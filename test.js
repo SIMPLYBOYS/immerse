@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { toSentences, splitPhrases, posOf, parseReply, markRate } = require("./content.js");
+const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor } = require("./content.js");
 
 // --- parseReply ---
 const reply = parseReply(`CONTEXT: "Grew into" means developed into something larger.
@@ -280,16 +280,17 @@ assert.deepEqual(markTarget("I have seen it.", "see"), [{ text: "I have seen it.
 assert.deepEqual(markTarget("nothing here", "absent"), [{ text: "nothing here" }]);
 assert.deepEqual(markTarget(undefined, "x"), [{ text: "" }]);
 
-// --- markRate: the ten-marks-per-hour guard, measured on the immersion clock ---
-const marked = [{ atSec: 100 }, { atSec: 3500 }, { atSec: 3700 }, {}]; // the last one predates it
-assert.equal(markRate(marked, 3700), 2); // only the two inside the trailing hour
-// after another hour of watching, the earlier marks age out of the window
-assert.equal(markRate(marked, 7400), 0);
-// a week away from YouTube must not expire the budget — it is immersion time, not wall clock
-assert.equal(markRate([{ atSec: 50 }], 60), 1);
+// --- markRate: ten marks per wall-clock hour ---
+const H = 3600_000;
+const marked = [
+  { addedAt: T0 - 30 * 60_000 }, // half an hour ago: counts
+  { addedAt: T0 - 10 * H }, // last night's session: must NOT still fill the window
+  {}, // legacy row without a stamp: never counted
+];
+assert.equal(markRate(marked, T0), 1);
 // 已掌握 never consumes the budget: the cap protects the review queue, which suspended words
 // never enter — marking known words is tagging, not scheduling
-assert.equal(markRate([{ atSec: 3500 }, { atSec: 3500, suspended: true }], 3600), 1);
+assert.equal(markRate([{ addedAt: T0 - 60_000 }, { addedAt: T0 - 60_000, suspended: true }], T0), 1);
 
 // --- LLM cost accounting ---
 const usage = {
@@ -381,3 +382,19 @@ assert.deepEqual(grouped.map((g) => [g.label, g.items.map((w) => w.id)]), [
 require("child_process").execFileSync(process.execPath, [__dirname + "/smoke.js"], {
   stdio: "inherit",
 });
+
+// --- zhFor: why the Chinese line used to vanish on short sentences ---
+const zh = [
+  { start: 0, end: 4, text: "第一句。" },
+  { start: 4, end: 9, text: "第二句，" },
+  { start: 9, end: 12, text: "接續。" },
+];
+assert.equal(zhFor(zh, { start: 0, end: 5 }), "第一句。");
+assert.equal(zhFor(zh, { start: 5, end: 12 }), "第二句，接續。");
+// the regression itself: a short sentence whose translation cue began a beat early — the old
+// start-in-window test matched nothing here and the line disappeared entirely
+assert.equal(zhFor(zh, { start: 4.5, end: 6 }), "第二句，");
+// the last sentence has end = Infinity and must still find its cue
+assert.equal(zhFor(zh, { start: 9, end: Infinity }), "接續。");
+assert.equal(zhFor([], { start: 0, end: 5 }), ""); // no zh track at all: empty, not a crash
+
