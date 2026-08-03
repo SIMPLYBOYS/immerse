@@ -23,27 +23,43 @@ assert.equal(parseReply("CONTEXT: x\nSENSE: v.").senses.length, 0);
 // a reply that ignored the format entirely still shows up as plain text
 assert.equal(parseReply("just a sentence").context, "just a sentence");
 const { toCsv, rowsFor, totals, costOf, money } = require("./options.js");
-const { schedule, stats, forecast, isDue, urgency, buildQueue, streakOf, byVideo, markTarget,
-  todayMins, masteredSince, GOAL_MIN } = require("./review.js");
+const { schedule, stats, forecast, isDue, recallOf, buildQueue, streakOf, byVideo, markTarget,
+  todayMins, masteredSince, addedSince, dayKeys, dayKey, dueAt, GOAL_MIN } = require("./review.js");
+const { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches } =
+  require("./analytics.js");
+const { searchWords, filterWords, dueLabel, groupWords } = require("./library.js");
 
 // --- SM-2 ---
 const T0 = 1_700_000_000_000;
 const DAY = 86400000;
 
+// Dues land on the 4am day boundary: a word reviewed tonight is due after sleep, on the next
+// study day — not at the same wall-clock hour tomorrow, which a morning session would keep
+// missing by ~10 hours every round.
+assert.equal(new Date(dueAt(T0, 1)).getHours(), 4);
+assert.notEqual(dayKey(dueAt(T0, 1)), dayKey(T0)); // never due again on the day it was reviewed
+assert.ok(dueAt(T0, 1) > T0);
+
 // first correct answer → 1 day, second → 6, then interval * ease
 let c = schedule({}, 4, T0);
 assert.equal(c.interval, 1);
-assert.equal(c.due, T0 + DAY);
+assert.equal(c.due, dueAt(T0, 1));
 c = schedule(c, 4, T0);
 assert.equal(c.interval, 6);
 c = schedule(c, 4, T0);
 assert.equal(c.interval, Math.round(6 * c.ease));
 
-// forgetting resets the streak and schedules for tomorrow, and counts a lapse
+// forgetting resets the streak and schedules for tomorrow, counts a lapse, and — because the
+// two-grade UI's success delta is exactly zero — carries the only per-card difficulty signal:
+// each lapse lowers ease, so a word you keep forgetting grows its intervals more slowly
 const lapsed = schedule({ reps: 5, interval: 40, ease: 2.5 }, 0, T0);
 assert.equal(lapsed.reps, 0);
 assert.equal(lapsed.interval, 1);
 assert.equal(lapsed.lapses, 1);
+assert.equal(lapsed.ease, 2.3);
+assert.equal(schedule({ ease: 1.35 }, 0, T0).ease, 1.3); // penalty respects the floor
+// ...and the ease actually bites: the post-lapse growth is slower than a fresh card's
+assert.ok(Math.round(6 * lapsed.ease) < Math.round(6 * 2.5));
 
 // ease can never fall below 1.3, however many times it is failed
 let bad = { ease: 1.4, reps: 3, interval: 10 };
@@ -58,15 +74,27 @@ assert.equal(isDue({ suspended: true, due: T0 - DAY }, T0), false);
 
 assert.deepEqual(
   stats([{}, { due: T0 - 1 }, { suspended: true, due: T0 - 1 }, { due: T0 + 9 * DAY }], T0),
-  { learning: 3, known: 1, due: 2, retention: null }, // no reviews yet → no rate to report
+  { predicted: null, learning: 3, known: 1, due: 2, correct: null }, // nothing scheduled yet
 );
-assert.equal(stats([{ reviews: 10, lapses: 2 }], T0).retention, 80);
+// the two rates answer different questions and must not be conflated
+assert.equal(stats([{ reviews: 10, lapses: 2 }], T0).correct, 80); // historical hit rate
+assert.equal(stats([{ due: T0, interval: 6 }], T0).predicted, 90); // still-recallable right now
+// a card with a due date but no interval cannot be estimated — it must be left out of the
+// average, not counted as 0%, or one legacy row reads as "you have forgotten everything"
+assert.equal(stats([{ due: T0, interval: 6 }, { due: T0 }], T0).predicted, 90);
 
-// --- urgency: overdue-ness relative to the interval, which is what decides review order ---
-// two days late on a two-day interval is far more urgent than two days late on a sixty-day one
+// --- recallOf: the forgetting curve the review order is built on ---
+// a card sitting exactly on its due date is ~90% recallable, by construction
+assert.equal(Math.round(recallOf({ due: T0, interval: 6 }, T0) * 100), 90);
+// two days late on a two-day interval has decayed far more than two days late on a sixty-day one
 assert.ok(
-  urgency({ due: T0 - 2 * DAY, interval: 2 }, T0) > urgency({ due: T0 - 2 * DAY, interval: 60 }, T0),
+  recallOf({ due: T0 - 2 * DAY, interval: 2 }, T0) < recallOf({ due: T0 - 2 * DAY, interval: 60 }, T0),
 );
+// reviewed a day ago on a six-day interval: still nearly certain, but not certain
+assert.equal(Math.round(recallOf({ due: T0 + 5 * DAY, interval: 6 }, T0) * 100), 98);
+// the curve is clamped: no arrangement of dates may report better than certainty
+assert.equal(recallOf({ due: T0 + 10 * DAY, interval: 1 }, T0), 1);
+assert.equal(recallOf({}, T0), 0); // never scheduled — nothing to recall yet
 
 // --- buildQueue: the fix for "every session starts with the same words" ---
 const deck = [
@@ -106,7 +134,20 @@ assert.equal(streakOf({ [key(yesterday)]: G, [key(twoAgo)]: G }, T0, G), 2);
 assert.equal(todayMins({ [key(today)]: 1830 }, T0), 30); // seconds → whole minutes
 assert.equal(todayMins({}, T0), 0);
 
-assert.equal(masteredSince([{ knownAt: T0 - DAY }, { knownAt: T0 - 30 * DAY }, {}], T0 - 7 * DAY), 1);
+assert.equal(
+  masteredSince(
+    [
+      { suspended: true, knownAt: T0 - DAY },
+      { suspended: true, knownAt: T0 - 30 * DAY }, // mastered, but before the window
+      { knownAt: T0 - DAY }, // demoted back to 學習中: stamp alone must not count
+      {},
+    ],
+    T0 - 7 * DAY,
+  ),
+  1,
+);
+// words added before the field existed have no addedAt, so they count as older than any window
+assert.equal(addedSince([{ addedAt: T0 - DAY }, { addedAt: T0 - 30 * DAY }, {}], T0 - 7 * DAY), 1);
 
 assert.deepEqual(
   byVideo([{ videoId: "a", title: "A" }, { videoId: "b" }, { videoId: "a", title: "A" }]).map(
@@ -246,6 +287,9 @@ assert.equal(markRate(marked, 3700), 2); // only the two inside the trailing hou
 assert.equal(markRate(marked, 7400), 0);
 // a week away from YouTube must not expire the budget — it is immersion time, not wall clock
 assert.equal(markRate([{ atSec: 50 }], 60), 1);
+// 已掌握 never consumes the budget: the cap protects the review queue, which suspended words
+// never enter — marking known words is tagging, not scheduling
+assert.equal(markRate([{ atSec: 3500 }, { atSec: 3500, suspended: true }], 3600), 1);
 
 // --- LLM cost accounting ---
 const usage = {
@@ -261,6 +305,76 @@ assert.equal(money(null), "—");
 assert.equal(money(0.0004), "< $0.01");
 assert.equal(money(1.239), "$1.24");
 assert.deepEqual(totals({}), { calls: 0, in: 0, out: 0 });
+
+// --- analytics ---
+const keys = dayKeys(3, T0);
+assert.equal(keys.length, 3);
+assert.equal(keys[2], dayKey(T0)); // oldest first, so today is last
+assert.deepEqual(seriesOf({ [keys[0]]: 5 }, keys), [5, 0, 0]); // missing days read as zero
+
+// buckets, not a scale — a four-hour binge must not make a real 30-minute day look empty
+assert.deepEqual([0, 5, 20, 45, 200].map(heatLevel), [0, 1, 2, 3, 4]);
+
+assert.equal(efficiencyOf(10, 3600), 10); // ten words in an hour
+assert.equal(efficiencyOf(5, 1800), 10);
+assert.equal(efficiencyOf(10, 0), null); // no immersion at all is undefined, not "0 per hour"
+
+assert.equal(activeDaysOf({ [keys[0]]: 60, [keys[1]]: 0 }, keys), 1);
+assert.deepEqual(addedPerDay([{ addedAt: T0 }, { addedAt: T0 }, {}], dayKey), { [dayKey(T0)]: 2 });
+
+// --- top videos & leeches ---
+const tv = topVideos(
+  [
+    { videoId: "a", title: "A", suspended: true },
+    { videoId: "a", title: "A" },
+    { videoId: "b", title: "B" },
+  ],
+  { a: 1800 }, // half an hour on video A
+);
+assert.deepEqual(tv.map((g) => [g.title, g.total, g.known, g.learning, g.perHour]), [
+  ["A", 2, 1, 1, 4], // 2 words in 0.5h
+  ["B", 1, 0, 1, null], // no immersion recorded → no rate, rather than a fake zero
+]);
+
+assert.deepEqual(
+  leeches([{ word: "a", lapses: 5 }, { word: "b", lapses: 1 }, { word: "c", lapses: 3 }]).map(
+    (w) => w.word,
+  ),
+  ["a", "c"], // worst first, and a single lapse is not yet a leech
+);
+
+// --- library search ---
+const lib = [
+  { id: "a", word: "grew into", contextZh: "發展成為", sentence: "It grew into the foundation." },
+  { id: "b", word: "laptop", context: "a portable computer", title: "Run LLMs Locally" },
+];
+assert.deepEqual(searchWords(lib, "").length, 2);
+assert.deepEqual(searchWords(lib, "GREW").map((w) => w.id), ["a"]); // case-insensitive
+assert.deepEqual(searchWords(lib, "發展").map((w) => w.id), ["a"]); // the Chinese explanation
+assert.deepEqual(searchWords(lib, "foundation").map((w) => w.id), ["a"]); // the sentence
+assert.deepEqual(searchWords(lib, "locally").map((w) => w.id), ["b"]); // the video title
+assert.deepEqual(searchWords(lib, "zzz"), []);
+
+assert.equal(dueLabel({ suspended: true }, T0), "已掌握");
+assert.equal(dueLabel({}, T0), "尚未複習");
+assert.equal(dueLabel({ due: T0 - DAY }, T0), "今天到期"); // overdue reads as due now, not "-1 天"
+assert.equal(dueLabel({ due: T0 + 3 * DAY }, T0), "3 天後");
+
+assert.deepEqual(filterWords(lib, "all").length, 2);
+assert.deepEqual(filterWords([{ suspended: true }, {}], "known").length, 1);
+assert.deepEqual(filterWords([{ suspended: true }, {}], "learning").length, 1);
+
+// grouped by the day it was added, newest group first, with today/yesterday named
+const grouped = groupWords(
+  [{ id: "n", addedAt: T0 }, { id: "y", addedAt: T0 - DAY }, { id: "old" }],
+  dayKey,
+  T0,
+);
+assert.deepEqual(grouped.map((g) => [g.label, g.items.map((w) => w.id)]), [
+  ["今天", ["n"]],
+  ["昨天", ["y"]],
+  ["更早", ["old"]], // no addedAt at all still gets a home rather than vanishing
+]);
 
 // The pure functions above are only half the risk. start_() never runs in Node, so a load-time
 // error (a const used before its declaration, a missing global) sails past every assertion here.

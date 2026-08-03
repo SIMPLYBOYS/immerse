@@ -6,6 +6,18 @@ const dayKey = (t) => {
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
 };
 
+// Due dates land on the 4am day boundary (Anki's rollover), not at now + n×86400s. A person
+// reviews at roughly the same hour each day, so timestamp-exact dues drift against the habit:
+// a 10pm review with a one-day interval comes due at 10pm tomorrow, which a morning session
+// misses — the card is actually seen ~34 hours later, every round, while SM-2 assumes it was
+// seen on time. "Review tomorrow" is day-granular for a human; 4am marks the night's sleep.
+const ROLLOVER_H = 4;
+function dueAt(now, intervalDays) {
+  const d = new Date(now + intervalDays * DAY);
+  d.setHours(ROLLOVER_H, 0, 0, 0);
+  return d.getTime();
+}
+
 // SM-2 — the algorithm Anki ran on for twenty years.
 // ponytail: FSRS schedules measurably better, but ts-fsrs means npm and a bundler, which this
 // project has stayed free of. Revisit if the intervals actually feel wrong in use.
@@ -15,15 +27,22 @@ function schedule(card, quality, now = Date.now()) {
   c.reviews += 1;
   if (quality < 3) {
     c.reps = 0;
-    c.interval = 1; // relearn tomorrow rather than today: sleep is the point of spacing
+    // The long-term schedule restarts at a day. The same-session retry is the review screen's
+    // job, not the curve's — see grade().
+    c.interval = 1;
     c.lapses += 1;
+    // Original SM-2 leaves ease untouched on failure, but under the two-grade UI the success
+    // path's ease delta is exactly zero (q=4 → +0.1 − 0.1), which left ease frozen at 2.5 for
+    // every card. A lapse penalty — Anki's default — is then the only signal that a particular
+    // card is hard: words you keep forgetting grow their intervals more slowly.
+    c.ease = Math.max(1.3, c.ease - 0.2);
   } else {
     c.reps += 1;
     c.interval = c.reps === 1 ? 1 : c.reps === 2 ? 6 : Math.round(c.interval * c.ease);
     // Standard SM-2 ease adjustment, floored at 1.3 so a run of bad answers can't collapse it.
     c.ease = Math.max(1.3, c.ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02)));
   }
-  c.due = now + c.interval * DAY;
+  c.due = dueAt(now, c.interval);
   return c;
 }
 
@@ -31,19 +50,24 @@ function schedule(card, quality, now = Date.now()) {
 // the library but is never scheduled again.
 const isDue = (w, now) => !w.suspended && (w.due ?? 0) <= now;
 
-// How much of the memory has probably decayed: two days late on a two-day interval is far more
-// urgent than two days late on a sixty-day one. This is what stops every session opening with the
-// same handful of words in insertion order.
-function urgency(w, now) {
-  if (!w.due) return 1; // never reviewed: mid priority, so new words interleave with reviews
-  return (now - w.due) / DAY / Math.max(1, w.interval ?? 1);
+// Predicted probability the word is still recallable, on the same curve SM-2's intervals assume:
+// a card sitting exactly on its due date is about 90% recallable and decays from there. Two days
+// late on a two-day interval has decayed far more than two days late on a sixty-day one, which is
+// what stops every session opening with the same handful of words in insertion order.
+// ponytail: a one-parameter curve. FSRS fits difficulty and stability per card and predicts this
+// properly — but it means ts-fsrs, npm and a bundler.
+function recallOf(w, now = Date.now()) {
+  if (!w.due || !w.interval) return 0; // never scheduled: nothing to recall yet
+  const sinceReview = (now - (w.due - w.interval * DAY)) / DAY;
+  return Math.min(1, 0.9 ** (sinceReview / w.interval));
 }
 
 // Reviews come first by urgency; a capped, shuffled handful of new words is spread through them
 // so a session is neither all-new nor always in the same order.
 function buildQueue(words, now = Date.now(), rand = Math.random) {
   const due = words.filter((w) => isDue(w, now));
-  const review = due.filter((w) => w.due).sort((a, b) => urgency(b, now) - urgency(a, now));
+  // Least recallable first — the ones closest to being forgotten are worth the most.
+  const review = due.filter((w) => w.due).sort((a, b) => recallOf(a, now) - recallOf(b, now));
   const fresh = due
     .filter((w) => !w.due)
     .map((w) => [rand(), w])
@@ -63,11 +87,20 @@ function buildQueue(words, now = Date.now(), rand = Math.random) {
 const stats = (words, now = Date.now()) => {
   const reviews = words.reduce((n, w) => n + (w.reviews ?? 0), 0);
   const lapses = words.reduce((n, w) => n + (w.lapses ?? 0), 0);
+  // Two different questions, deliberately kept apart: `predicted` is how much of the deck you
+  // could still recall right now, `correct` is how often you have answered right historically.
+  // Both fields, not just `due`: a card we cannot estimate must be left out of the average rather
+  // than averaged in as 0%, which would read as "you have forgotten everything".
+  const scheduled = words.filter((w) => !w.suspended && w.due && w.interval);
+  const predicted = scheduled.length
+    ? Math.round((scheduled.reduce((n, w) => n + recallOf(w, now), 0) / scheduled.length) * 100)
+    : null;
   return {
+    predicted,
     learning: words.filter((w) => !w.suspended).length,
     known: words.filter((w) => w.suspended).length,
     due: words.filter((w) => isDue(w, now)).length,
-    retention: reviews ? Math.round(((reviews - lapses) / reviews) * 100) : null,
+    correct: reviews ? Math.round(((reviews - lapses) / reviews) * 100) : null,
   };
 };
 
@@ -88,9 +121,18 @@ function streakOf(log, now = Date.now(), min = 1) {
   return n;
 }
 
+// Oldest first — the shape every chart on the analytics tab wants. dayKey lives here so there is
+// exactly one definition of "which day is this", shared by whatever writes and whatever reads.
+const dayKeys = (n, now = Date.now()) =>
+  Array.from({ length: n }, (_, i) => dayKey(now - (n - 1 - i) * DAY));
+
 const GOAL_MIN = 30; // zeroStudy's default daily immersion target
 const todayMins = (immLog, now = Date.now()) => Math.floor((immLog[dayKey(now)] ?? 0) / 60);
-const masteredSince = (words, since) => words.filter((w) => (w.knownAt ?? 0) >= since).length;
+// `suspended` too, not just the stamp: a word demoted back to 學習中 keeps its history but is no
+// longer mastered, and must not linger in the weekly count.
+const masteredSince = (words, since) =>
+  words.filter((w) => w.suspended && (w.knownAt ?? 0) >= since).length;
+const addedSince = (words, since) => words.filter((w) => (w.addedAt ?? 0) >= since).length;
 
 // Split a sentence around the target so the card can highlight it in place. Recall works from the
 // phrase as it was heard, in its own sentence — a bare headword tests recognition, not retrieval.
@@ -134,6 +176,7 @@ function wire() {
   let immLog = {};
   let total = 0;
   let done = 0;
+  let relearned = new Set(); // ids re-queued this session, so one miss cannot loop forever
 
   function paint() {
     const now = Date.now();
@@ -154,8 +197,11 @@ function wire() {
     $("today").textContent = `✓ 今日複習 ${log[dayKey(now)] ?? 0} 詞`;
     // The denominator of the ten-marks-per-hour rule, so the warning in the popup has a meaning.
     $("imm").textContent = `⏱ 累計沉浸 ${Math.floor(immersion / 3600)}h ${Math.floor((immersion % 3600) / 60)}m`;
+    $("total").textContent = s.learning + s.known;
     $("weekKnown").textContent = masteredSince(words, now - 7 * DAY);
-    $("retention").textContent = s.retention === null ? "—" : `${s.retention}%`;
+    $("weekAdded").textContent = addedSince(words, now - 7 * DAY);
+    $("predicted").textContent = s.predicted === null ? "—" : `${s.predicted}%`;
+    $("correct").textContent = s.correct === null ? "—" : `${s.correct}%`;
     $("learning").textContent = s.learning;
     $("known").textContent = s.known;
     const size = Math.max(1, s.learning + s.known); // not `total`: that one counts the session
@@ -205,6 +251,7 @@ function wire() {
     if (!queue.length) return;
     total = queue.length;
     done = 0;
+    relearned = new Set();
     $("home").hidden = true;
     $("card").hidden = false;
     next();
@@ -274,6 +321,15 @@ function wire() {
     log[dayKey(now)] = (log[dayKey(now)] ?? 0) + 1;
     chrome.storage.local.set({ words, log });
     done += 1;
+    // A word you just got wrong comes back a few cards later in this same session. Ending a
+    // review having only ever failed an item is the one thing spacing cannot repair. Its
+    // long-term schedule is untouched — that stays with the curve; this is only about not
+    // walking away from a miss. Once per session, so a hard word can't trap you in a loop.
+    if (q < 3 && !relearned.has(card.id)) {
+      relearned.add(card.id);
+      queue.splice(Math.min(queue.length, 4), 0, card);
+      total += 1;
+    }
     next();
   }
 
@@ -296,6 +352,17 @@ function wire() {
     $("zh").hidden = false;
     $("showzh").hidden = true;
   });
+
+  // Tabs. Each view reloads its own data when shown rather than sharing state — three small
+  // independent readers beat one store everything has to agree about.
+  const views = ["viewReview", "viewStats", "viewLib"];
+  for (const b of document.querySelectorAll("nav button")) {
+    b.addEventListener("click", () => {
+      for (const o of document.querySelectorAll("nav button")) o.classList.toggle("on", o === b);
+      for (const id of views) $(id).hidden = id !== b.dataset.view;
+      document.dispatchEvent(new CustomEvent("im-view", { detail: b.dataset.view }));
+    });
+  }
 
   $("start").addEventListener("click", () => run(words));
   $("reveal").addEventListener("click", reveal);
@@ -338,5 +405,5 @@ function wire() {
 
 if (typeof document !== "undefined") wire();
 if (typeof module !== "undefined")
-  module.exports = { schedule, stats, forecast, isDue, urgency, buildQueue, streakOf, byVideo,
-    markTarget, todayMins, masteredSince, GOAL_MIN };
+  module.exports = { schedule, stats, forecast, isDue, buildQueue, streakOf, byVideo,
+    markTarget, todayMins, masteredSince, addedSince, dayKeys, dayKey, recallOf, dueAt, GOAL_MIN };

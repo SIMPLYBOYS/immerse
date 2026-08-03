@@ -6,7 +6,7 @@ const assert = require("assert");
 const node = () => ({
   style: {},
   dataset: {},
-  classList: { add() {}, contains: () => false },
+  classList: { add() {}, toggle() {}, contains: () => false },
   textContent: "",
   className: "",
   hidden: false,

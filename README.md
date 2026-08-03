@@ -24,6 +24,9 @@ phrasal verbs and slang — so the explanation leads with context, not with a di
 - **Sentence navigation.** <kbd>A</kbd> previous sentence, <kbd>S</kbd> replay, <kbd>D</kbd> next
   — real sentence boundaries, not caption chunks.
 - **Chinese subtitles** with <kbd>Z</kbd>, at no API cost (YouTube's own translation).
+- **Listening mode** with <kbd>X</kbd>: the English captions blur to unreadable so your ear does
+  the work; hover a word to peek at just that word. Pair with <kbd>Z</kbd> for translation-only
+  listening. Reading captions is the path of least resistance, and the brain will take it.
 - **Hover to freeze.** Moving the mouse onto a word pauses the video so you can actually click it;
   moving away resumes.
 - **Spaced repetition** built in. Mark a word 學習中, and it enters an SM-2 review queue ordered by
@@ -129,6 +132,8 @@ MIT — see [LICENSE](LICENSE).
 - **詞性上色**：動詞藍、名詞琥珀、形容詞綠、介系詞粉紅、功能詞灰掉。
 - **句子導航**：<kbd>A</kbd> 上一句、<kbd>S</kbd> 重播、<kbd>D</kbd> 下一句——切在真正的句子邊界。
 - **中文對照字幕**（<kbd>Z</kbd>），零 API 成本，用的是 YouTube 自己的翻譯。
+- **進階聽力模式**（<kbd>X</kbd>）：英文字幕模糊到不可讀，逼耳朵工作；滑到單一個字上偷看那個字。
+  搭配 <kbd>Z</kbd> 就是「只看翻譯」的聽力訓練。依賴文字是聽力的殺手。
 - **滑到字上就暫停**，移開繼續，不用先按空白鍵。
 - **間隔重複複習**：按下「學習中」才進詞彙庫，佇列依「記憶衰退程度」排序。
 

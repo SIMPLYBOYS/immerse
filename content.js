@@ -85,9 +85,12 @@ function parseReply(text) {
 const MARKS_PER_HOUR = 10;
 
 // Marks are stamped with the immersion clock rather than wall-clock time, so a week away from
-// YouTube doesn't reset the budget and a binge doesn't get a free pass.
+// YouTube doesn't reset the budget and a binge doesn't get a free pass. Only 學習中 counts:
+// the cap exists to protect the review queue, and a word marked 已掌握 never enters it.
 function markRate(words, immSec, windowSec = 3600) {
-  return words.filter((w) => w.atSec != null && w.atSec > immSec - windowSec).length;
+  return words.filter(
+    (w) => !w.suspended && w.atSec != null && w.atSec > immSec - windowSec,
+  ).length;
 }
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -153,7 +156,7 @@ function toSentences(cues) {
 }
 
 function start_() {
-  const state = { captures: [], open: null, marks: {}, zhOn: false,
+  const state = { captures: [], open: null, marks: {}, zhOn: false, blurOn: false,
     trackUrl: null, cues: [], sentences: [], zhCues: [], phrases: [], pos: {} };
   window.__im = state;
 
@@ -170,10 +173,15 @@ function start_() {
       const day = new Date();
       const key = `${day.getFullYear()}-${day.getMonth() + 1}-${day.getDate()}`;
       // ponytail: read-modify-write, so two YouTube tabs open at once can lose a few seconds.
-      getStore(["immersion", "immLog"]).then(({ immersion = 0, immLog = {} }) => {
-        immLog[key] = (immLog[key] ?? 0) + delta;
-        setStore({ immersion: immersion + delta, immLog });
-      });
+      const vid = new URLSearchParams(location.search).get("v");
+      getStore(["immersion", "immLog", "immByVideo"]).then(
+        ({ immersion = 0, immLog = {}, immByVideo = {} }) => {
+          immLog[key] = (immLog[key] ?? 0) + delta;
+          // Per-video too, so "words per hour" can be answered for one video and not just overall.
+          if (vid) immByVideo[vid] = (immByVideo[vid] ?? 0) + delta;
+          setStore({ immersion: immersion + delta, immLog, immByVideo });
+        },
+      );
     }
   }
 
@@ -194,13 +202,29 @@ function start_() {
   const getStore = (keys, fallback = {}) => safe(() => chrome.storage.local.get(keys), fallback);
   const setStore = (obj) => safe(() => chrome.storage.local.set(obj), undefined);
 
-  getStore(["marks", "zhOn", "immersion"]).then((r) => {
+  getStore(["marks", "zhOn", "blurOn", "immersion"]).then((r) => {
     state.marks = r.marks ?? {};
     state.zhOn = !!r.zhOn;
     state.imm = r.immersion ?? 0;
     state.immSaved = state.imm;
+    setBlur(!!r.blurOn);
     repaint();
   });
+
+  // 進階聽力: blur the English words so the ear has to do the work — reading captions is the
+  // path of least resistance, and the brain will take it every time it is available. Hovering
+  // peeks at one word (and the hover-freeze pauses the video, so a peek also stops the clock);
+  // the Chinese line stays sharp, which combined with Z gives translation-only listening.
+  // CSS does all of it: the toggle is just a class on <html>.
+  function setBlur(on) {
+    state.blurOn = on;
+    document.documentElement.classList.toggle("im-blur", on);
+  }
+
+  function toggleBlur() {
+    setBlur(!state.blurOn);
+    setStore({ blurOn: state.blurOn });
+  }
 
   // sendMessage reports a dead service worker through lastError, not through the reply — without
   // this the failure arrives as a bare `undefined` and looks like an empty answer.
@@ -437,6 +461,7 @@ function start_() {
     } else {
       const row = {
         atSec: state.imm, // only set on first add; the spread below keeps an existing stamp
+        addedAt: Date.now(), // ditto — the date it entered the deck, for the weekly count
         ...(at >= 0 ? words[at] : {}), // keep whatever scheduling the card already has
         id,
         word: item.word,
@@ -473,8 +498,11 @@ function start_() {
     const words = await deck(item, clearing ? null : how);
     const n = markRate(words, state.imm);
     // A warning, not a block: it is your call, but an unclearable backlog is the failure mode.
+    // "近一小時沉浸", not "本小時" — the window is an hour of watch time, not a wall-clock hour.
     state.markNote =
-      n > MARKS_PER_HOUR ? `本小時已標記 ${n} 個，建議 ≤ ${MARKS_PER_HOUR}，標太多會複習不完` : "";
+      n > MARKS_PER_HOUR
+        ? `近一小時沉浸已標記 ${n} 個學習中，建議 ≤ ${MARKS_PER_HOUR}，標太多會複習不完`
+        : "";
     render();
   }
 
@@ -488,12 +516,17 @@ function start_() {
     paintZh();
   }
 
+  // The line lives INSIDE YouTube's caption window, not at fixed viewport coordinates. The old
+  // approach measured the segments' rect and pinned a fixed div under it — but the segments are
+  // rebuilt several times a second, a mid-rebuild rect reads 0,0, and the line jumped to the
+  // top-left of the screen. As a child of the window it rides along with dragging, fullscreen
+  // and reflow for free, with no coordinate maths to go stale.
   function paintZh() {
     let el = document.getElementById("im-zh");
     if (!el) {
       el = document.createElement("div");
       el.id = "im-zh";
-      document.body.appendChild(el);
+      document.body.appendChild(el); // reparented under the caption window as soon as one exists
     }
     const segs = document.querySelectorAll(SEG);
     const s = state.sentences[playing()];
@@ -503,15 +536,18 @@ function start_() {
     }
     // The Chinese track is segmented differently from the English one (332 cues vs 168), so it is
     // matched by time window rather than paired by index.
-    el.textContent = state.zhCues
+    const text = state.zhCues
       .filter((c) => c.start >= s.start && c.start < s.end)
       .map((c) => c.text)
       .join("");
-    const first = segs[0].getBoundingClientRect();
-    const last = segs[segs.length - 1].getBoundingClientRect();
-    el.style.display = el.textContent ? "block" : "none";
-    el.style.left = `${first.left}px`;
-    el.style.top = `${last.bottom + 4}px`;
+    // Both writes are guarded: our own MutationObserver watches this subtree, and an
+    // unconditional append/textContent every tick would be a mutation loop.
+    const win = segs[segs.length - 1].closest(".caption-window");
+    if (win && el.parentElement !== win) win.appendChild(el);
+    if (el.textContent !== text) el.textContent = text;
+    // Track the caption font so fullscreen scales the translation with the English above it.
+    el.style.fontSize = `${parseFloat(getComputedStyle(segs[0]).fontSize) * 0.72 || 18}px`;
+    el.style.display = text ? "block" : "none";
   }
 
   // --- popup ----------------------------------------------------------------------------------
@@ -609,6 +645,7 @@ function start_() {
 
   const hide = () => {
     state.open = null;
+    state.markNote = ""; // the warning is feedback on the mark just made, not a persistent banner
     render();
     thaw();
   };
@@ -652,9 +689,8 @@ function start_() {
       const focused = document.activeElement;
       // Don't hijack the search box or a comment field.
       if (focused && (focused.isContentEditable || /input|textarea/i.test(focused.tagName))) return;
-      const act = { a: () => seek(-1), s: () => seek(0), d: () => seek(1), z: toggleZh }[
-        e.key.toLowerCase()
-      ];
+      const act = { a: () => seek(-1), s: () => seek(0), d: () => seek(1), z: toggleZh,
+        x: toggleBlur }[e.key.toLowerCase()];
       if (!act) return;
       e.preventDefault();
       e.stopPropagation();
@@ -666,8 +702,11 @@ function start_() {
   document.head.appendChild(document.createElement("style")).textContent = `
     /* Every word gets an outline so it reads as clickable; marked ones override the colour. */
     .im-w{pointer-events:auto;cursor:pointer;border-radius:5px;padding:0 3px;
-      box-shadow:inset 0 0 0 1px #ffffff40}
+      box-shadow:inset 0 0 0 1px #ffffff40;transition:filter .15s}
     .im-w:hover{background:#fc0;color:#000;box-shadow:inset 0 0 0 1px #fc0}
+    /* .28em, not px: caption font size jumps in fullscreen and the blur must stay unreadable */
+    html.im-blur .im-w{filter:blur(.28em)}
+    html.im-blur .im-w:hover{filter:none}
     /* content words bright, function words dim, particles loud — that contrast is what makes a
        phrasal verb visible at a glance */
     .im-verb{color:#7fd1ff}
@@ -678,8 +717,9 @@ function start_() {
     .im-phrase{box-shadow:inset 0 0 0 2px #fc0a}
     .im-learning{box-shadow:inset 0 0 0 2px #4af}
     .im-known{box-shadow:inset 0 0 0 2px #4c8}
-    #im-zh{position:fixed;z-index:99998;max-width:80vw;padding:2px 8px;background:#000a;color:#fff;
-      border-radius:4px;font:20px/1.4 -apple-system,system-ui,sans-serif;pointer-events:none}
+    #im-zh{position:relative;margin-top:4px;padding:2px 8px;background:#000a;color:#fff;
+      border-radius:4px;font-family:-apple-system,system-ui,sans-serif;line-height:1.5;
+      text-align:center;pointer-events:none}
     #im-pop{position:fixed;z-index:99999;width:360px;max-height:60vh;overflow:auto;
       padding:12px 14px;background:#111e;color:#eee;border-radius:8px;
       font:13px/1.55 -apple-system,system-ui,sans-serif;box-shadow:0 6px 24px #0008}
