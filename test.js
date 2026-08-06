@@ -66,8 +66,11 @@ let bad = { ease: 1.4, reps: 3, interval: 10 };
 for (let i = 0; i < 10; i++) bad = schedule(bad, 3, T0);
 assert.ok(bad.ease >= 1.3);
 
-// a newly added word has no `due`, so it is due immediately
-assert.equal(isDue({}, T0), true);
+// marking IS the first study event, so a word marked today surfaces tomorrow, not immediately —
+// the same one-sleep principle every later review follows
+assert.equal(isDue({ addedAt: T0 }, T0), false);
+assert.equal(isDue({ addedAt: T0 - DAY }, T0), true); // marked yesterday: today's queue has it
+assert.equal(isDue({}, T0), true); // legacy rows without a stamp stay available
 assert.equal(isDue({ due: T0 + DAY }, T0), false);
 // 已掌握 suspends: it stays in the library but is never scheduled, even when overdue
 assert.equal(isDue({ suspended: true, due: T0 - DAY }, T0), false);
@@ -105,8 +108,10 @@ const deck = [
   { id: "later", due: T0 + 5 * DAY, interval: 10 },
   { id: "sus", suspended: true },
 ];
+deck.push({ id: "fresh", addedAt: T0 }); // marked minutes ago
 const q = buildQueue(deck, T0, () => 0.5).map((w) => w.id);
 assert.ok(!q.includes("later") && !q.includes("sus")); // not due / suspended never queue
+assert.ok(!q.includes("fresh")); // today's marks wait for tomorrow's session
 assert.equal(q[0], "urgent"); // most decayed first, not insertion order
 assert.ok(q.indexOf("mild") < q.length); // reviews all present
 assert.equal(q.length, 4);
@@ -406,4 +411,16 @@ assert.equal(cueUrl(stashed).searchParams.get("pot"), "SIG"); // the signature s
 assert.equal(cueUrl(stashed).searchParams.get("fmt"), "json3");
 // the zh fetch re-adds exactly the language it wants
 assert.equal(cueUrl(stashed, "zh-Hant").searchParams.get("tlang"), "zh-Hant");
+
+// --- mid-cue sentence starts: why S (replay) stuck on the last word ---
+// A cue holding "tail of sentence N. start of N+1" used to give N+1 the CUE's start time —
+// up to a whole cue early, inside N's own tail — so replay jumped onto N's last word.
+const mid = toSentences([
+  { start: 0, end: 4, text: "First one. Second" },
+  { start: 4, end: 8, text: "half done." },
+]);
+assert.equal(mid.length, 2);
+assert.equal(mid[1].text, "Second half done.");
+assert.ok(mid[1].start > 2 && mid[1].start < 4); // interpolated into the cue, past "First one."
+assert.equal(mid[0].end, mid[1].start); // sentence N keeps its tail — playing() attribution follows
 

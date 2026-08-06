@@ -46,9 +46,17 @@ function schedule(card, quality, now = Date.now()) {
   return c;
 }
 
-// A newly added word has no `due`, so it is due immediately. 已掌握 suspends a card: it stays in
-// the library but is never scheduled again.
-const isDue = (w, now) => !w.suspended && (w.due ?? 0) <= now;
+// 已掌握 suspends a card: it stays in the library but is never scheduled again. A newly marked
+// word is NOT due the day it was marked — the marking moment, reading the full in-context
+// explanation, is itself the first study event, and drilling it minutes later retrieves a memory
+// that hasn't begun to decay. The first retrieval belongs after a night's sleep, on the next
+// study day, exactly like every later review.
+const isDue = (w, now) => {
+  if (w.suspended) return false;
+  if (w.due) return w.due <= now;
+  if (w.addedAt) return dueAt(w.addedAt, 1) <= now;
+  return true; // legacy rows without any stamp: available immediately
+};
 
 // Predicted probability the word is still recallable, on the same curve SM-2's intervals assume:
 // a card sitting exactly on its due date is about 90% recallable and decays from there. Two days

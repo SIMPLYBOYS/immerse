@@ -133,7 +133,8 @@ function splitPhrases(text, phrases = []) {
 
 // Stitch the timed cues into sentences. Cues break mid-sentence ("...like Qwen, Kimmy, and the" /
 // "GLM family are..."), so the text is concatenated and re-split on punctuation. Each sentence
-// keeps the start time of the cue it began in — that is what A/S/D seeks to.
+// carries the time its first word is spoken — cue start when it opens a cue, interpolated by
+// character position when it starts mid-cue. That is what A/S/D seeks to.
 function toSentences(cues) {
   const out = [];
   let buf = "";
@@ -145,9 +146,18 @@ function toSentences(cues) {
     while ((m = buf.match(SENTENCE))) {
       out.push({ text: m[1].trim(), start });
       buf = buf.slice(m[0].length);
-      // Anything left over began inside this cue; if nothing is left, the next sentence starts
-      // in whichever cue comes next — not this one.
-      start = buf.trim() ? c.start : null;
+      if (!buf.trim()) {
+        // Nothing left over: the next sentence starts in whichever cue comes next.
+        start = null;
+      } else {
+        // The next sentence starts mid-cue. A cue-granular start sits up to a whole cue early —
+        // inside the tail of the sentence just pushed — so the previous sentence's last words
+        // were attributed to the next one, and S (replay) kept landing on its own last word.
+        // Interpolate by character position; without a finite cue end, fall back to cue start.
+        const consumed = Math.max(0, c.text.length - buf.length);
+        const dur = Number.isFinite(c.end) ? c.end - c.start : 0;
+        start = c.start + (c.text.length && dur > 0 ? (dur * consumed) / c.text.length : 0);
+      }
     }
   }
   if (buf.trim()) out.push({ text: buf.trim(), start });
@@ -185,8 +195,9 @@ function cueUrl(url, tlang) {
 }
 
 function start_() {
-  const state = { captures: [], open: null, marks: {}, zhOn: false, blurOn: false,
-    trackUrl: null, cues: [], sentences: [], zhCues: [], phrases: [], pos: {} };
+  const state = { captures: [], open: null, anchor: null, marks: {}, zhOn: false, blurOn: false,
+    trackUrl: null, cues: [], sentences: [], zhCues: [], phrases: [], pos: {},
+    explains: new Map() }; // word|sentence → in-flight or settled explanation, so a re-click never re-bills
   window.__im = state;
 
   // Immersion clock: seconds of video actually playing in a visible tab. Flushed every 15s rather
@@ -257,13 +268,19 @@ function start_() {
 
   // sendMessage reports a dead service worker through lastError, not through the reply — without
   // this the failure arrives as a bare `undefined` and looks like an empty answer.
-  const ask = (payload) =>
+  const askOnce = (payload) =>
     new Promise((ok) => {
       if (!alive()) return ok({ error: "擴充剛重新載入，請重新整理這個分頁" });
       chrome.runtime.sendMessage(payload, (r) =>
         ok(chrome.runtime.lastError ? { error: chrome.runtime.lastError.message } : r),
       );
     });
+  // "message channel closed" = the worker died mid-call (idle kill, update). The failure is the
+  // worker's, not the request's — a new message wakes a fresh worker, so one retry usually lands.
+  const ask = (payload) =>
+    askOnce(payload).then((r) =>
+      String(r?.error ?? "").includes("message channel closed") ? askOnce(payload) : r,
+    );
   const video = () => document.querySelector("video");
 
   // --- transcript -----------------------------------------------------------------------------
@@ -426,7 +443,9 @@ function start_() {
   function chip(display, word, isPhrase) {
     const el = document.createElement("span");
     const how = state.marks[word.toLowerCase()]; // marks are case-insensitive
-    el.className = ["im-w", isPhrase && "im-phrase", how && `im-${how}`].filter(Boolean).join(" ");
+    // im-anchor re-applied on rebuild, same as the mark colours — the spans are ephemeral.
+    el.className = ["im-w", isPhrase && "im-phrase", how && `im-${how}`,
+      word === state.anchor && "im-anchor"].filter(Boolean).join(" ");
     el.append(...posSpans(display)); // keeps the comma; dataset holds the clean word
     el.dataset.imWord = word;
     return el;
@@ -434,9 +453,12 @@ function start_() {
 
   function tokenSpans(text) {
     const frag = document.createDocumentFragment();
+    // Phrases the user circled and marked join the model-detected ones, so a learned expression
+    // keeps rendering as one boxed unit in every later video.
+    const phrases = state.phrases.concat(Object.keys(state.marks).filter((k) => k.includes(" ")));
     // ponytail: a caption line can cut a phrase in half; that one just renders as separate
     // words rather than being tracked across segments.
-    for (const run of splitPhrases(text, state.phrases)) {
+    for (const run of splitPhrases(text, phrases)) {
       if (run.phrase) {
         frag.appendChild(chip(run.text, run.text, true));
         continue;
@@ -464,8 +486,8 @@ function start_() {
     paintZh();
   }
 
-  function capture(el) {
-    const word = el.dataset.imWord;
+  function capture(el, phrase) {
+    const word = phrase ?? el.dataset.imWord;
     const videoId = new URLSearchParams(location.search).get("v");
     const t = +(video()?.currentTime ?? 0).toFixed(2);
     const s = sentenceFor(word);
@@ -480,10 +502,25 @@ function start_() {
       return;
     }
     render();
-    ask({ type: "explain", word, sentence: s.text }).then((r) => {
-      Object.assign(item, parseReply(r?.text ?? r?.error ?? "(no reply)"), { done: true });
+    // One request per (word, sentence), shared and cached: re-opening the card, or clicking the
+    // same word twice quickly, must not bill twice. Errors are evicted so a retry really retries.
+    const cacheKey = `${word}|${s.text}`;
+    const hit = state.explains.get(cacheKey);
+    const job =
+      hit ??
+      ask({ type: "explain", word, sentence: s.text }).then((r) => {
+        if (r?.text) return parseReply(r.text);
+        state.explains.delete(cacheKey);
+        return parseReply(r?.error ?? "(no reply)");
+      });
+    if (!hit) state.explains.set(cacheKey, job);
+    job.then((parsed) => {
+      Object.assign(item, parsed, { done: true });
+      // Marked before the reply landed: the stored row was saved empty, so write it back now
+      // that there is something worth reviewing.
+      const how = state.marks[item.word.toLowerCase()];
+      if (how) deck(item, how);
       render();
-      console.log("[immerse]", item);
     });
   }
 
@@ -651,21 +688,34 @@ function start_() {
       return;
     }
     const { item, el } = state.open;
+    const sent = document.createElement("div");
+    sent.className = "im-sent";
+    sent.appendChild(tokenSpans(item.sentence ?? ""));
     box.replaceChildren(
       head(item.word),
       // Chinese first — it is the line that unblocks you. English stays underneath as input.
       line(item.done ? item.contextZh || item.context : "…", "im-ai"),
       ...(item.contextZh && item.context ? [line(item.context, "im-ai-en")] : []),
       ...item.senses.map(sense),
-      line(item.sentence ?? "", "im-sent"),
+      // The sentence renders as clickable word chips, exactly like the captions — reading the
+      // card IS the moment you notice the phrase, so circling has to work right here, not only
+      // down in the captions (which may even have moved on).
+      sent,
       buttons(item),
       ...(state.markNote ? [line(state.markNote, "im-warn")] : []),
+      ...(item.word.includes(" ") ? [] : [line("在下面例句按住滑鼠掃過幾個字：圈成片語一起學（字幕上用 ⇧+點兩端）", "im-note")]),
       line(state.phraseNote ?? "…finding phrases", "im-note"),
     );
-    const r = el.getBoundingClientRect();
     box.style.display = "block";
-    box.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 380))}px`;
-    box.style.bottom = `${innerHeight - r.top + 8}px`;
+    // The anchor span is destroyed whenever the captions repaint — marking a word repaints to
+    // recolour it — and a detached node measures 0,0, flinging the popup off-screen. That looks
+    // exactly like the card closing. Reposition only while the anchor is still live; otherwise
+    // hold the last position and let the reply land in a popup the user can still see.
+    if (el.isConnected) {
+      const r = el.getBoundingClientRect();
+      box.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 380))}px`;
+      box.style.bottom = `${innerHeight - r.top + 8}px`;
+    }
   }
 
   // Hovering a word freezes the caption so it can be clicked at all — by the time you decide,
@@ -685,9 +735,15 @@ function start_() {
     video()?.play();
   };
 
+  const clearAnchor = () => {
+    state.anchor = null;
+    document.querySelectorAll(".im-anchor").forEach((c) => c.classList.remove("im-anchor"));
+  };
+
   const hide = () => {
     state.open = null;
     state.markNote = ""; // the warning is feedback on the mark just made, not a persistent banner
+    clearAnchor();
     render();
     thaw();
   };
@@ -703,11 +759,82 @@ function start_() {
     if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return;
     e.stopPropagation(); // the player toggles play/pause on click; that decision is ours
     e.preventDefault();
-    if (e.type === "click") capture(el);
+    if (e.type !== "click") return;
+    // 圈選: shift-click marks one end, shift-click again marks the other, and the words between
+    // become one phrase card. Shift rather than drag, because dragging moves the caption box.
+    // ONLY an explicit shift-click sets an end — an earlier version treated the open card's word
+    // as a free first end, which hijacked any attempt to circle a different pair while a card was
+    // open into one giant junk phrase. The anchor is a WORD, never an element — YouTube rebuilds
+    // the caption spans at will (the popup fly-away bug had the same root), so any stored node
+    // may be disconnected by the second click; the element is re-found here.
+    if (e.shiftKey) {
+      const chips = [...document.querySelectorAll(".im-w")];
+      // Both ends must live in the same place — the popup's sentence or the captions — or the
+      // slice between them would cross containers and join unrelated words.
+      const pop = el.closest("#im-pop");
+      const from = (w) =>
+        w ? chips.find((c) => c.dataset.imWord === w && c !== el && c.closest("#im-pop") === pop) : null;
+      const anchor = from(state.anchor);
+      if (!anchor) {
+        clearAnchor();
+        state.anchor = el.dataset.imWord;
+        el.classList.add("im-anchor");
+        freeze(); // hold the caption still while the other end is picked
+        return;
+      }
+      const [i, j] = [chips.indexOf(anchor), chips.indexOf(el)].sort((x, y) => x - y);
+      clearAnchor();
+      return capture(el, chips.slice(i, j + 1).map((c) => c.dataset.imWord).join(" "));
+    }
+    clearAnchor();
+    capture(el);
   }
 
   let down = null;
-  document.addEventListener("pointerdown", (e) => (down = { x: e.clientX, y: e.clientY }), true);
+  // zeroStudy-style 拖曳圈選, on the card's example sentence only: press a word, sweep, release —
+  // the swept words open as one phrase card. Only there, because on the captions a drag already
+  // means "move the caption box" (explicitly kept working, at the user's request), and shift-click
+  // handles circling in the captions instead.
+  let sweep = null; // the sentence chip the press started on
+  const SENT_W = "#im-pop .im-sent .im-w";
+  const sentChips = () => [...document.querySelectorAll(SENT_W)];
+  document.addEventListener(
+    "pointerdown",
+    (e) => {
+      down = { x: e.clientX, y: e.clientY };
+      sweep = e.target.closest?.(SENT_W) ?? null;
+    },
+    true,
+  );
+  document.addEventListener(
+    "mouseover",
+    (e) => {
+      if (!sweep?.isConnected) return;
+      const c = e.target.closest?.(SENT_W);
+      if (!c) return;
+      const chips = sentChips();
+      const [i, j] = [chips.indexOf(sweep), chips.indexOf(c)].sort((a, b) => a - b);
+      chips.forEach((ch, k) => ch.classList.toggle("im-anchor", k >= i && k <= j));
+    },
+    true,
+  );
+  document.addEventListener(
+    "pointerup",
+    (e) => {
+      const start = sweep;
+      sweep = null;
+      if (!start?.isConnected) return;
+      const chips = sentChips();
+      chips.forEach((c) => c.classList.remove("im-anchor"));
+      const end = e.target.closest?.(SENT_W);
+      // Same chip = a plain click, which onWord already turns into a single-word card. The click
+      // event after a real sweep lands on the chips' common ancestor, not a chip, so it is inert.
+      if (!end || end === start) return;
+      const [i, j] = [chips.indexOf(start), chips.indexOf(end)].sort((a, b) => a - b);
+      capture(end, chips.slice(i, j + 1).map((c) => c.dataset.imWord).join(" "));
+    },
+    true,
+  );
   for (const type of ["click", "dblclick"]) document.addEventListener(type, onWord, true);
 
   // mouseover/mouseout bubble, unlike mouseenter/mouseleave — needed because the word spans are
@@ -743,7 +870,8 @@ function start_() {
 
   document.head.appendChild(document.createElement("style")).textContent = `
     /* Every word gets an outline so it reads as clickable; marked ones override the colour. */
-    .im-w{pointer-events:auto;cursor:pointer;border-radius:5px;padding:0 3px;
+    /* user-select:none — a shift-click must read as circle-selection, not native text selection */
+    .im-w{pointer-events:auto;cursor:pointer;user-select:none;border-radius:5px;padding:0 3px;
       box-shadow:inset 0 0 0 1px #ffffff40;transition:filter .15s}
     .im-w:hover{background:#fc0;color:#000;box-shadow:inset 0 0 0 1px #fc0}
     /* .28em, not px: caption font size jumps in fullscreen and the blur must stay unreadable */
@@ -757,6 +885,8 @@ function start_() {
     .im-prep{color:#ff7ab6}
     .im-aux,.im-det,.im-pron,.im-conj{color:#9aa}
     .im-phrase{box-shadow:inset 0 0 0 2px #fc0a}
+    /* one end of a shift-click circle-selection, waiting for the other end */
+    .im-anchor{box-shadow:inset 0 0 0 2px #fc0;background:#fc03}
     .im-learning{box-shadow:inset 0 0 0 2px #4af}
     .im-known{box-shadow:inset 0 0 0 2px #4c8}
     #im-zh{position:relative;margin-top:4px;padding:2px 8px;background:#000a;color:#fff;

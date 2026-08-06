@@ -100,24 +100,34 @@ async function meter(kind, usage) {
 async function claude(system, user, maxTokens, kind) {
   const { apiKey } = await chrome.storage.local.get("apiKey");
   if (!apiKey) throw new Error("no API key — set one in the extension options");
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      // Required for browser-originated calls, which includes an extension worker.
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens, // deliberately short; Haiku 4.5 rejects output_config.effort
-      system,
-      messages: [{ role: "user", content: user }],
-    }),
-  });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data?.error?.message ?? `HTTP ${r.status}`);
-  meter(kind, data.usage); // deliberately not awaited: metering must never delay the answer
-  return data.content?.find((b) => b.type === "text")?.text || "(no reply)";
+  // MV3 idle-kills this worker after ~30s without extension-API activity, and awaiting a fetch
+  // does not count as activity. A long generation — pos tags a whole transcript — can outlive
+  // that; death mid-fetch closes every open message channel at once ("the message channel closed
+  // before a response was received", for phrases AND pos together). Any extension API call
+  // resets the timer, so tick one while the request is in flight.
+  const beat = setInterval(chrome.runtime.getPlatformInfo, 20_000);
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        // Required for browser-originated calls, which includes an extension worker.
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: maxTokens, // deliberately short; Haiku 4.5 rejects output_config.effort
+        system,
+        messages: [{ role: "user", content: user }],
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data?.error?.message ?? `HTTP ${r.status}`);
+    meter(kind, data.usage); // deliberately not awaited: metering must never delay the answer
+    return data.content?.find((b) => b.type === "text")?.text || "(no reply)";
+  } finally {
+    clearInterval(beat);
+  }
 }
