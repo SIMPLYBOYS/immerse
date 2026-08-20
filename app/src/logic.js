@@ -8,8 +8,10 @@
 // device. Requiring them here is safe because every one guards its DOM wiring behind
 // `typeof document !== "undefined"`, which is false in React Native.
 module.exports = {
-  ...require("../../review.js"),
-  ...require("../../analytics.js"),
-  ...require("../../library.js"),
-  ...require("../../merge.js"),
+  ...require("./shared/content.js"), // splitPhrases / posOf / parseReply — the caption brain
+  ...require("./shared/prompts.js"), // the same model and prompts the extension asks with
+  ...require("./shared/review.js"),
+  ...require("./shared/analytics.js"),
+  ...require("./shared/library.js"),
+  ...require("./shared/merge.js"),
 };

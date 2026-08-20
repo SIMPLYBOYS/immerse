@@ -4,6 +4,7 @@ const { View, Text, TextInput, Pressable, ScrollView, Switch } = require("react-
 const { C, S } = require("../theme");
 const { saveSettings, saveReminder } = require("../store");
 const { enableDaily, disableDaily } = require("../notify");
+const { testAccess } = require("../cloud");
 
 const hh = (h) => `${String(h).padStart(2, "0")}:00`;
 
@@ -13,10 +14,12 @@ const hh = (h) => `${String(h).padStart(2, "0")}:00`;
 function Settings({ cfg, onSaved, onSync, status, busy }) {
   const [repo, setRepo] = useState(cfg.repo ?? "");
   const [token, setToken] = useState("");
+  const [apiKey, setApiKey] = useState("");
   const [msg, setMsg] = useState("");
   const [on, setOn] = useState(cfg.remind != null);
   const [hour, setHour] = useState(cfg.remind ?? 21);
   const [nmsg, setNmsg] = useState("");
+  const [tmsg, setTmsg] = useState("");
 
   // The OS owns the schedule, so every change re-arms it from scratch rather than trusting that
   // what we asked for last time is still there.
@@ -24,9 +27,9 @@ function Settings({ cfg, onSaved, onSync, status, busy }) {
     setOn(nextOn);
     setHour(nextHour);
     if (!nextOn) {
-      await disableDaily();
+      const off = await disableDaily();
       await saveReminder(null);
-      return setNmsg("已關閉");
+      return setNmsg(off.ok ? "已關閉" : off.error);
     }
     const r = await enableDaily(nextHour);
     if (!r.ok) {
@@ -39,10 +42,19 @@ function Settings({ cfg, onSaved, onSync, status, busy }) {
 
   const save = async () => {
     if (!repo.trim()) return setMsg("先填 repo");
-    await saveSettings({ repo, token });
-    setToken(""); // never keep a credential in component state longer than the save
+    await saveSettings({ repo, token, apiKey });
+    // Never keep a credential in component state longer than the save takes.
+    setToken("");
+    setApiKey("");
     setMsg("已儲存");
-    onSaved({ ...cfg, repo: repo.trim(), ...(token.trim() ? { token: token.trim() } : {}) });
+    // Same cleaning as the store, or this session would keep using the raw pasted value.
+    const clean = (x) => String(x ?? "").replace(/\s+/g, "");
+    onSaved({
+      ...cfg,
+      repo: clean(repo),
+      ...(clean(token) ? { token: clean(token) } : {}),
+      ...(clean(apiKey) ? { apiKey: clean(apiKey) } : {}),
+    });
   };
 
   return (
@@ -76,10 +88,38 @@ function Settings({ cfg, onSaved, onSync, status, busy }) {
           secureTextEntry
         />
 
+        <Text style={[S.label, { marginTop: 14 }]}>Anthropic API key（沉浸時點字解釋用）</Text>
+        <TextInput
+          style={[S.input, { marginTop: 6 }]}
+          value={apiKey}
+          onChangeText={setApiKey}
+          placeholder={cfg.apiKey ? "已儲存 — 輸入新的才會取代" : "sk-ant-..."}
+          placeholderTextColor="#bbb"
+          autoCapitalize="none"
+          autoCorrect={false}
+          secureTextEntry
+        />
+
         <Pressable style={[S.btn, S.primary, { marginTop: 14 }]} onPress={save}>
           <Text style={[S.btnText, S.primaryText]}>儲存</Text>
         </Pressable>
+        <Pressable
+          style={[S.btn, { marginTop: 8 }]}
+          onPress={async () => {
+            setTmsg("測試中…");
+            // The saved values, not what is typed — the boxes are blank on every visit, and the
+            // question being asked is whether what is STORED works.
+            const r = await testAccess(repo.trim() || cfg.repo, cfg.token);
+            setTmsg(r.msg);
+          }}
+        >
+          <Text style={S.btnText}>測試連線</Text>
+        </Pressable>
         {msg ? <Text style={[S.sub, { marginTop: 8 }]}>{msg}</Text> : null}
+        {tmsg ? <Text style={[S.sub, { marginTop: 6, lineHeight: 18 }]}>{tmsg}</Text> : null}
+        <Text style={[S.sub, { marginTop: 6, fontSize: 11 }]}>
+          目前存的 token：{cfg.token ? `…${String(cfg.token).slice(-6)}` : "（無）"}
+        </Text>
       </View>
 
       <View style={S.card}>
@@ -125,11 +165,6 @@ function Settings({ cfg, onSaved, onSync, status, busy }) {
           複習結果會在離開複習或切到背景時上傳，一場一個 commit。
         </Text>
       </View>
-
-      <Text style={[S.sub, { color: C.dim, lineHeight: 18 }]}>
-        手機端只做複習。在字幕上點字加入新詞彙仍然只能在桌機的擴充功能——手機的 YouTube
-        沒有擴充功能可以攔截字幕。
-      </Text>
     </ScrollView>
   );
 }

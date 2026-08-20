@@ -10,6 +10,7 @@ import { pull, push } from "./src/cloud";
 import { buildQueue, schedule, dayKey } from "./src/logic";
 import Home from "./src/screens/Home";
 import Card from "./src/screens/Card";
+import Immerse from "./src/screens/Immerse";
 import Library from "./src/screens/Library";
 import Stats from "./src/screens/Stats";
 import Settings from "./src/screens/Settings";
@@ -98,6 +99,41 @@ export default function App() {
     applyRow({ ...w, suspended, knownAt: suspended ? now : undefined, updatedAt: now });
   };
 
+  // A word met on the phone enters the deck in exactly the shape content.js writes on the
+  // desktop, so the merge sees one kind of row and the review card finds every field where it
+  // expects it. Unmarking is deliberately not offered here: removing a word needs a tombstone to
+  // survive the merge, and switching between 學習中 and 已掌握 covers what a phone is for.
+  const markWord = (item, how) => {
+    const now = Date.now();
+    const id = item.word.toLowerCase();
+    setDeck((d) => {
+      const at = d.words.findIndex((w) => w.id === id);
+      const row = {
+        addedAt: now, // kept by the spread below if the word is already known
+        ...(at >= 0 ? d.words[at] : {}),
+        id,
+        word: item.word,
+        context: item.context,
+        contextZh: item.contextZh,
+        senses: item.senses,
+        sentence: item.sentence,
+        zh: item.zh,
+        videoId: item.videoId,
+        title: item.title,
+        t: item.t,
+        suspended: how === "known",
+        knownAt: how === "known" ? now : undefined,
+        updatedAt: now,
+      };
+      return {
+        ...d,
+        words: at >= 0 ? d.words.map((w, i) => (i === at ? row : w)) : [...d.words, row],
+        marks: { ...d.marks, [id]: how },
+      };
+    });
+    dirty.current = true;
+  };
+
   const start = () => {
     const queue = buildQueue(deck.words);
     if (queue.length) setSession({ queue, i: 0, mastered: 0, relearned: [] });
@@ -168,6 +204,7 @@ export default function App() {
       );
     }
     if (!deck) return <Loading error={err} onRetry={() => sync(cfg)} />;
+    if (tab === "immerse") return <Immerse cfg={cfg} marks={deck.marks} onMark={markWord} />;
     if (tab === "library") return <Library deck={deck} onStatus={setStatus} />;
     if (tab === "stats") return <Stats deck={deck} />;
     if (session) {
@@ -230,9 +267,10 @@ function Tabs({ tab, setTab }) {
       }}
     >
       {[
+        ["immerse", "沉浸"],
         ["review", "記憶固化"],
         ["library", "詞彙庫"],
-        ["stats", "數據分析"],
+        ["stats", "數據"],
         ["settings", "設定"],
       ].map(([id, label]) => (
         <Pressable

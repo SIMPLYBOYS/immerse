@@ -6,7 +6,7 @@
 // only deck-app-<id>.json and never touches the extension's file, so no upload can lose the
 // other device's work.
 
-const { foldSnapshots } = require("../../merge.js");
+const { foldSnapshots } = require("./shared/merge.js");
 
 const API = "https://api.github.com";
 const DECK_RE = /^deck-.+\.json$/;
@@ -123,4 +123,72 @@ async function push(repo, token, deviceId, data, sha) {
   return (await r.json()).content.sha;
 }
 
-module.exports = { pull, push, b64, utf8Bytes, DECK_RE };
+// Transcripts are written by the desktop extension and only ever read here — the phone cannot
+// obtain them itself, because YouTube will not play, and therefore will not fetch its own
+// captions, inside a mobile WebView. The index exists so listing what is available costs one
+// request rather than one per video.
+const raw = { accept: "application/vnd.github.raw+json" };
+
+// The index makes listing one request instead of one per video, but it must never be the only
+// way to see what is there: it can be missing (transcripts written before it existed), deleted,
+// or half-written. Falling back to the directory listing means the folder itself is the truth.
+async function listTx(repo, token) {
+  const r = await gh(`/repos/${repo}/contents/tx/index.json`, { token, ...raw });
+  if (r) {
+    try {
+      const idx = JSON.parse(await r.text());
+      if (Object.keys(idx).length) return idx;
+    } catch {
+      // fall through to the listing
+    }
+  }
+  const dir = await gh(`/repos/${repo}/contents/tx`, { token });
+  const files = dir ? await dir.json().catch(() => []) : [];
+  // No titles here — they live inside each transcript, and fetching every one to read a title
+  // would defeat the point. The reader shows the real title once a video is opened, and the next
+  // transcript the extension saves republishes a proper index.
+  return Object.fromEntries(
+    (Array.isArray(files) ? files : [])
+      .filter((f) => f.name?.endsWith(".json") && f.name !== "index.json")
+      .map((f) => [f.name.replace(/\.json$/, ""), { title: f.name.replace(/\.json$/, ""), n: 0 }]),
+  );
+}
+
+async function getTx(repo, token, videoId) {
+  const r = await gh(`/repos/${repo}/contents/tx/${videoId}.json`, { token, ...raw });
+  if (!r) throw new Error("找不到這份逐字稿");
+  return JSON.parse(await r.text());
+}
+
+// Turns a bare "Bad credentials" into facts. It asks the endpoint we actually use — the repo
+// itself — because /user answers to a different permission on a fine-grained token and can say
+// 401 while the token is perfectly good for repository contents. GitHub's own message is passed
+// through verbatim rather than translated into a guess.
+async function testAccess(repo, token) {
+  const t = String(token ?? "");
+  const shape = `token 長度 ${t.length}${t.length ? `，開頭 ${t.slice(0, 8)}…` : ""}`;
+  if (!t) return { ok: false, msg: `沒有存到 token（${shape}）——請重新輸入並按儲存` };
+  if (!repo || !repo.includes("/"))
+    return { ok: false, msg: `repo 要寫成 擁有者/名稱，目前是「${repo}」` };
+  let r;
+  try {
+    r = await fetch(`${API}/repos/${repo}`, {
+      headers: { authorization: `Bearer ${t}`, accept: "application/vnd.github+json" },
+    });
+  } catch (e) {
+    return { ok: false, msg: `連不上 GitHub：${String(e?.message ?? e)}` };
+  }
+  const data = await r.json().catch(() => ({}));
+  if (r.ok) return { ok: true, msg: `✓ 可存取 ${data.full_name ?? repo}（${shape}）` };
+  const why =
+    r.status === 401
+      ? "token 無效、已被取代或已到期"
+      : r.status === 404
+        ? "名稱不對，或 token 的 Repository access 沒選到這個 repo"
+        : r.status === 403
+          ? "權限不足——需要 Contents: Read and write"
+          : "";
+  return { ok: false, msg: `HTTP ${r.status}：${data.message ?? ""}${why ? ` — ${why}` : ""}（${shape}）` };
+}
+
+module.exports = { pull, push, listTx, getTx, testAccess, b64, utf8Bytes, DECK_RE };

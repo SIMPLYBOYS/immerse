@@ -6,16 +6,22 @@
     "expo": "~57.0.14",
     "expo-notifications": "~57.0.12",
     "expo-secure-store": "~57.0.1",
+    "expo-speech": "~57.0.1",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
     "react-native": "0.86.2",
-    "react-native-safe-area-context": "~5.7.0"
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-webview": "13.16.1",
+    "react-native-youtube-iframe": "^2.4.1"
   },
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "sync-shared": "node scripts/sync-shared.mjs",
+    "prestart": "node scripts/sync-shared.mjs",
+    "eas-build-pre-install": "node scripts/sync-shared.mjs"
   },
   "private": true
 }

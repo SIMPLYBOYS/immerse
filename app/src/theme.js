@@ -13,6 +13,20 @@ const C = {
   amber: "#b26a00",
 };
 
+// The extension colours parts of speech against a black caption bar; the same hues would glare
+// on a white page, so these are the darker equivalents. Content words carry colour, function
+// words stay grey — that contrast is what makes a phrasal verb visible at a glance.
+const POS = {
+  verb: "#1a6fb5",
+  noun: "#9a6508",
+  adj: "#357a38",
+  prep: "#c2185b",
+  aux: "#9aa0a6",
+  det: "#9aa0a6",
+  pron: "#9aa0a6",
+  conj: "#9aa0a6",
+};
+
 const S = {
   screen: { flex: 1, backgroundColor: C.bg },
   pad: { padding: 16 },
@@ -52,4 +66,4 @@ const S = {
   },
 };
 
-module.exports = { C, S };
+module.exports = { C, S, POS };
