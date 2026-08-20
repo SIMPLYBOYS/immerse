@@ -25,6 +25,12 @@
     "plugins": [
       "expo-secure-store"
     ],
-    "scheme": "immerse"
+    "scheme": "immerse",
+    "extra": {
+      "eas": {
+        "projectId": "30059b7c-38fd-43e7-be69-e780626f30b3"
+      }
+    },
+    "owner": "aaron.chou"
   }
 }
