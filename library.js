@@ -54,7 +54,9 @@ function wireLibrary() {
   let status = "all";
   let openId = null;
 
-  const save = () => chrome.storage.local.set({ words, marks });
+  // Every write re-reads storage first and touches only the row it means to: this tab's copy is
+  // as old as the last time the tab was shown, and writing it back wholesale used to wipe every
+  // word marked on a video since then — the "已掌握 sometimes doesn't stick" bug.
 
   function paint() {
     const shown = searchWords(filterWords(words, status), $("q").value);
@@ -76,15 +78,23 @@ function wireLibrary() {
     w.suspended = how === "known";
     if (w.suspended) w.knownAt = Date.now();
     else delete w.knownAt; // demoting un-masters it — the weekly count must not keep it
+    const r = await chrome.storage.local.get(["words", "marks"]);
+    words = r.words ?? [];
+    marks = r.marks ?? {};
+    const at = words.findIndex((x) => x.id === w.id);
+    if (at >= 0)
+      words[at] = { ...words[at], suspended: w.suspended, knownAt: w.knownAt, updatedAt: Date.now() };
     marks[w.id] = how;
-    await save();
+    await chrome.storage.local.set({ words, marks });
     paint();
   }
 
   async function remove(w) {
-    words = words.filter((x) => x.id !== w.id);
+    const r = await chrome.storage.local.get(["words", "marks"]);
+    words = (r.words ?? []).filter((x) => x.id !== w.id);
+    marks = r.marks ?? {};
     delete marks[w.id];
-    await save();
+    await chrome.storage.local.set({ words, marks });
     paint();
   }
 
@@ -154,6 +164,13 @@ function wireLibrary() {
       marks = r.marks ?? {};
       paint();
     });
+  });
+  // Marks made on videos while this tab sits open arrive as storage events, not tab switches.
+  chrome.storage.onChanged?.addListener((ch, area) => {
+    if (area !== "local" || (!ch.words && !ch.marks)) return;
+    if (ch.words) words = ch.words.newValue ?? [];
+    if (ch.marks) marks = ch.marks.newValue ?? {};
+    if (!document.getElementById("viewLib").hidden) paint();
   });
 }
 

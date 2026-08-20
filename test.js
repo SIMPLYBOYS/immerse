@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl } = require("./content.js");
+const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl, CLAUSE } = require("./content.js");
 
 // --- parseReply ---
 const reply = parseReply(`CONTEXT: "Grew into" means developed into something larger.
@@ -24,7 +24,7 @@ assert.equal(parseReply("CONTEXT: x\nSENSE: v.").senses.length, 0);
 assert.equal(parseReply("just a sentence").context, "just a sentence");
 const { toCsv, rowsFor, totals, costOf, money } = require("./options.js");
 const { schedule, stats, forecast, isDue, recallOf, buildQueue, streakOf, byVideo, markTarget,
-  todayMins, masteredSince, addedSince, dayKeys, dayKey, dueAt, GOAL_MIN } = require("./review.js");
+  todayMins, masteredSince, addedSince, dayKeys, dayKey, dueAt, debtOf, GOAL_MIN } = require("./review.js");
 const { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches } =
   require("./analytics.js");
 const { searchWords, filterWords, dueLabel, groupWords } = require("./library.js");
@@ -138,6 +138,21 @@ assert.equal(streakOf({ [key(yesterday)]: G, [key(twoAgo)]: G }, T0, G), 2);
 
 assert.equal(todayMins({ [key(today)]: 1830 }, T0), 30); // seconds → whole minutes
 assert.equal(todayMins({}, T0), 0);
+
+// --- 單字負債: marked long ago, never reviewed once — candidates for cleanup ---
+assert.deepEqual(
+  debtOf(
+    [
+      { id: "a", addedAt: T0 - 40 * DAY }, // old and never reviewed: debt
+      { id: "b", addedAt: T0 - 40 * DAY, reviews: 3 }, // has been reviewed: earning its keep
+      { id: "c", addedAt: T0 - 40 * DAY, suspended: true }, // mastered: not owed anything
+      { id: "d", addedAt: T0 - 5 * DAY }, // too recent to call
+      { id: "e" }, // earliest schema, no stamp: age unknown, but still never reviewed → debt
+    ],
+    T0,
+  ).map((w) => w.id),
+  ["a", "e"],
+);
 
 assert.equal(
   masteredSince(
@@ -270,6 +285,25 @@ assert.equal(toSentences([{ start: 0, text: "llama.cpp is fast." }]).length, 1);
 
 // A trailing fragment with no closing punctuation still comes back rather than vanishing.
 assert.equal(toSentences([{ start: 0, text: "no end here" }])[0].text, "no end here");
+
+// --- CLAUSE: comma-level cuts for A/S/D and card timestamps ---
+// One long ASR sentence becomes three hops, each with an interpolated start inside the cue.
+const cl = toSentences(
+  [{ start: 0, end: 12, text: "Well, since the dawn of time, humans dreamed of flight." }],
+  CLAUSE,
+);
+assert.deepEqual(cl.map((x) => x.text),
+  ["Well,", "since the dawn of time,", "humans dreamed of flight."]);
+assert.equal(cl[0].start, 0);
+assert.ok(cl[1].start > 0 && cl[1].start < cl[2].start); // starts advance through the cue
+assert.equal(cl[0].end, cl[1].start); // hops tile the timeline with no gaps
+// "1,000" has no space after the comma and must stay whole.
+assert.equal(toSentences([{ start: 0, text: "It costs 1,000 dollars." }], CLAUSE).length, 1);
+// The default (sentence) behaviour is untouched: same input, one segment.
+assert.equal(
+  toSentences([{ start: 0, end: 12, text: "Well, since the dawn of time, humans dreamed of flight." }]).length,
+  1,
+);
 
 console.log("ok");
 

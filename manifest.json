@@ -1,28 +1,60 @@
 {
   "manifest_version": 3,
   "name": "immerse",
-  "version": "3.13.0",
+  "version": "3.19.0",
   "description": "Click a word in the YouTube captions, get a definition plus an AI explanation in context.",
   "options_page": "options.html",
-  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "action": {
     "default_title": "immerse 記憶固化",
-    "default_icon": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
   },
-  "permissions": ["storage"],
-  "host_permissions": ["https://api.anthropic.com/*"],
-  "background": { "service_worker": "bg.js" },
+  "permissions": [
+    "storage",
+    "identity",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://www.googleapis.com/*",
+    "https://api.github.com/*"
+  ],
+  "background": {
+    "service_worker": "bg.js"
+  },
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["hook.js"],
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "hook.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "oauth2": {
+    "client_id": "48219721836-52b8kakaoobf4v9bai9nnus4ttu3fit2.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.file"
+    ]
+  }
 }

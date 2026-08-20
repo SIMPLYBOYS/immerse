@@ -8,6 +8,9 @@ const WORD = /[A-Za-z][A-Za-z'’-]*/;
 // A sentence ends only when the punctuation is followed by space/end, so "llama.cpp" stays whole.
 // ponytail: "3.5" mid-number can still false-close one. Rare enough to eat.
 const SENTENCE = /^([\s\S]*?[.!?]+)(\s+|$)/;
+// Clause-level cut for navigation: ASR "sentences" run long, and replaying one to hear a single
+// word means sitting through all of it. Commas need trailing whitespace so "1,000" stays whole.
+const CLAUSE = /^([\s\S]*?(?:[.!?]+|[,;:]))(\s+|$)/;
 
 // Closed word classes: the full membership is short and fixed, so a lookup table is exact and
 // free. Only verbs and nouns are open-ended enough to need the model.
@@ -132,10 +135,11 @@ function splitPhrases(text, phrases = []) {
 }
 
 // Stitch the timed cues into sentences. Cues break mid-sentence ("...like Qwen, Kimmy, and the" /
-// "GLM family are..."), so the text is concatenated and re-split on punctuation. Each sentence
+// "GLM family are..."), so the text is concatenated and re-split on punctuation. Each segment
 // carries the time its first word is spoken — cue start when it opens a cue, interpolated by
-// character position when it starts mid-cue. That is what A/S/D seeks to.
-function toSentences(cues) {
+// character position when it starts mid-cue. Called twice per track: with SENTENCE for the
+// card/explain context, with CLAUSE for A/S/D navigation and card timestamps.
+function toSentences(cues, re = SENTENCE) {
   const out = [];
   let buf = "";
   let start = null;
@@ -143,7 +147,7 @@ function toSentences(cues) {
     if (start === null) start = c.start;
     buf = buf ? `${buf} ${c.text}` : c.text;
     let m;
-    while ((m = buf.match(SENTENCE))) {
+    while ((m = buf.match(re))) {
       out.push({ text: m[1].trim(), start });
       buf = buf.slice(m[0].length);
       if (!buf.trim()) {
@@ -196,7 +200,7 @@ function cueUrl(url, tlang) {
 
 function start_() {
   const state = { captures: [], open: null, anchor: null, marks: {}, zhOn: false, blurOn: false,
-    trackUrl: null, cues: [], sentences: [], zhCues: [], phrases: [], pos: {},
+    trackUrl: null, cues: [], sentences: [], clauses: [], zhCues: [], phrases: [], pos: {},
     explains: new Map() }; // word|sentence → in-flight or settled explanation, so a re-click never re-bills
   window.__im = state;
 
@@ -248,6 +252,15 @@ function start_() {
     state.imm = r.immersion ?? 0;
     state.immSaved = state.imm;
     setBlur(!!r.blurOn);
+    repaint();
+  });
+
+  // Other pages rewrite marks too (library status buttons, debt cleanup). Without this, the next
+  // mark here would write this tab's stale copy back over their change — the same lost-update bug
+  // the review page had, in the other direction. Caption colours follow along for free.
+  chrome.storage?.onChanged?.addListener((ch, area) => {
+    if (area !== "local" || !alive() || !ch.marks) return;
+    state.marks = ch.marks.newValue ?? {};
     repaint();
   });
 
@@ -317,6 +330,7 @@ function start_() {
     state.pos = {};
     state.cues = await fetchCues(url);
     state.sentences = toSentences(state.cues);
+    state.clauses = toSentences(state.cues, CLAUSE);
     if (state.zhOn) state.zhCues = await fetchCues(url, "zh-Hant");
     console.log("[immerse]", state.sentences.length, "sentences from", state.cues.length, "cues");
     // Homepage preview players fire timedtext requests too, and those often yield no usable
@@ -389,27 +403,32 @@ function start_() {
     repaint();
   }
 
-  const playing = () => {
+  const idxAt = (list) => {
     const t = video()?.currentTime ?? 0;
-    return state.sentences.findIndex((s) => t >= s.start && t < s.end);
+    return list.findIndex((s) => t >= s.start && t < s.end);
   };
+  const playing = () => idxAt(state.sentences);
 
   // The caption on screen lags the clock by up to a cue, so trust the word over the timestamp.
-  function sentenceFor(word) {
-    const k = playing();
+  function segFor(list, word) {
+    const k = idxAt(list);
     if (k < 0) return null;
     const re = bounded(word);
     for (const j of [k, k - 1, k + 1]) {
-      if (state.sentences[j] && re.test(state.sentences[j].text)) return state.sentences[j];
+      if (list[j] && re.test(list[j].text)) return list[j];
     }
-    return state.sentences[k];
+    return list[k];
   }
+  const sentenceFor = (word) => segFor(state.sentences, word);
 
+  // A/S/D moves by CLAUSE, not sentence: an ASR sentence can run twenty seconds, and replaying
+  // all of it to hear one word again is dead time. Comma-level hops keep the loop tight.
   function seek(delta) {
     const v = video();
-    if (!v || !state.sentences.length) return;
-    const k = Math.max(0, playing());
-    const target = state.sentences[Math.min(state.sentences.length - 1, Math.max(0, k + delta))];
+    const list = state.clauses?.length ? state.clauses : state.sentences;
+    if (!v || !list.length) return;
+    const k = Math.max(0, idxAt(list));
+    const target = list[Math.min(list.length - 1, Math.max(0, k + delta))];
     if (target) v.currentTime = target.start;
   }
 
@@ -489,8 +508,12 @@ function start_() {
   function capture(el, phrase) {
     const word = phrase ?? el.dataset.imWord;
     const videoId = new URLSearchParams(location.search).get("v");
-    const t = +(video()?.currentTime ?? 0).toFixed(2);
     const s = sentenceFor(word);
+    // The card's timestamp anchors to the start of the CLAUSE holding the word, not the click
+    // moment: a click lands anywhere in a long ASR sentence, so 回到影片那一刻 used to drop you
+    // mid-sentence and the word only turned up near its end — or had already passed.
+    const c = segFor(state.clauses ?? [], word);
+    const t = +(c?.start ?? video()?.currentTime ?? 0).toFixed(2);
     const item = { id: `${videoId}:${t}:${word}`, word, videoId, t, sentence: s?.text ?? null,
       context: "", senses: [], done: false };
     state.captures.push(item);
@@ -528,7 +551,11 @@ function start_() {
   // a commitment to memorise it — auto-saving every click filled the review queue with noise.
   // Keyed on the lowercased word, so meeting the same word in a second video updates one entry
   // rather than creating a duplicate card.
-  async function deck(item, how) {
+  // Writes are chained one at a time: deck is a read-modify-write, and two in flight at once —
+  // a fresh mark racing the explain-reply backfill — silently lose the earlier one.
+  let deckChain = Promise.resolve();
+  const deck = (item, how) => (deckChain = deckChain.then(() => deckWrite(item, how)));
+  async function deckWrite(item, how) {
     const { words = [] } = await getStore("words");
     const id = item.word.toLowerCase();
     const at = words.findIndex((w) => w.id === id);
@@ -550,6 +577,7 @@ function start_() {
         t: item.t,
         suspended: how === "known", // 已掌握 stays in the library but off the review queue
         knownAt: how === "known" ? Date.now() : undefined, // for the "mastered this week" count
+        updatedAt: Date.now(), // per-row stamp, so a future second writer (the app) can merge
       };
       if (at >= 0) words[at] = row;
       else words.push(row);
@@ -578,6 +606,44 @@ function start_() {
         ? `近一小時已標記 ${n} 個學習中，建議 ≤ ${MARKS_PER_HOUR}，標太多會複習不完`
         : "";
     render();
+  }
+
+  // --- transcript export ------------------------------------------------------------------------
+  // E copies the whole transcript to the clipboard — the same cues the extension already holds.
+  // With the Z line on, each sentence is paired with YouTube's own zh-Hant translation, so the
+  // export costs no API call either way. Plain text, no timestamps: it is for reading and for
+  // pasting into notes, not for re-subtitling.
+  function toast(msg) {
+    let el = document.getElementById("im-toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "im-toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.opacity = "1";
+    clearTimeout(state.toastT);
+    state.toastT = setTimeout(() => (el.style.opacity = "0"), 2200);
+  }
+
+  async function copyTranscript() {
+    if (!state.sentences.length) return toast("還沒有字幕——請先開啟 CC 字幕再按 E");
+    let lines = state.sentences.map((s) => s.text);
+    if (state.zhOn) {
+      if (!state.zhCues.length && state.trackUrl) {
+        state.zhCues = await fetchCues(state.trackUrl, "zh-Hant");
+      }
+      lines = state.sentences.map((s) => `${s.text}\n${zhFor(state.zhCues, s)}`);
+    }
+    const title = document.title.replace(/ - YouTube$/, "");
+    const vid = new URLSearchParams(location.search).get("v");
+    const text = `${title}\nhttps://youtu.be/${vid}\n\n${lines.join(state.zhOn ? "\n\n" : "\n")}`;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(`已複製完整字幕（${state.sentences.length} 句${state.zhOn ? "，中英對照" : ""}）`);
+    } catch {
+      toast("複製失敗——請點一下頁面再按 E");
+    }
   }
 
   // --- Chinese line ---------------------------------------------------------------------------
@@ -859,7 +925,7 @@ function start_() {
       // Don't hijack the search box or a comment field.
       if (focused && (focused.isContentEditable || /input|textarea/i.test(focused.tagName))) return;
       const act = { a: () => seek(-1), s: () => seek(0), d: () => seek(1), z: toggleZh,
-        x: toggleBlur }[e.key.toLowerCase()];
+        x: toggleBlur, e: copyTranscript }[e.key.toLowerCase()];
       if (!act) return;
       e.preventDefault();
       e.stopPropagation();
@@ -911,7 +977,10 @@ function start_() {
     #im-pop .im-btns{margin-top:10px;display:flex;gap:8px}
     #im-pop .im-btns button{flex:1;padding:5px;font:inherit;cursor:pointer;
       border:1px solid #555;border-radius:5px;background:#222;color:#ccc}
-    #im-pop .im-btns button.on{background:#4af;border-color:#4af;color:#000}`;
+    #im-pop .im-btns button.on{background:#4af;border-color:#4af;color:#000}
+    #im-toast{position:fixed;left:50%;bottom:72px;transform:translateX(-50%);z-index:99999;
+      background:#111e;color:#eee;padding:8px 16px;border-radius:999px;font:13px/1.4
+      -apple-system,system-ui,sans-serif;opacity:0;transition:opacity .3s;pointer-events:none}`;
 
   // The caption container is created/destroyed as CC toggles, so re-attach when it changes.
   const obs = new MutationObserver(tick);
@@ -938,4 +1007,5 @@ function start_() {
 }
 
 if (typeof document !== "undefined") start_();
-if (typeof module !== "undefined") module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl };
+if (typeof module !== "undefined")
+  module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl, CLAUSE };

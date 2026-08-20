@@ -35,6 +35,25 @@ profile can read the key.</p>
 <code>options.js</code> 的 <code>PRICES</code>。</p>
 <button id="resetUsage">歸零</button>
 
+<h3>雲端同步（GitHub）</h3>
+<form id="gh">
+  <label for="ghRepo">Private repo（owner/名稱）</label>
+  <input id="ghRepo" placeholder="SIMPLYBOYS/immerse-data" autocomplete="off" />
+  <label for="ghToken" style="display:block;margin-top:8px">Fine-grained token（只需該 repo 的
+  Contents 讀寫權限）</label>
+  <input id="ghToken" type="password" placeholder="github_pat_..." autocomplete="off" />
+  <button>Save</button><span id="ghMsg"></span>
+</form>
+<p id="syncStatus">未連結。</p>
+<button id="syncConnect">連結並開始同步</button>
+<button id="syncNow" hidden>立即上傳</button>
+<button id="syncRestore" hidden>從雲端還原</button>
+<button id="syncOff" hidden>停用同步</button>
+<p>學習資料（詞彙、標記、每日紀錄）鏡像到你自己 private repo 裡的 <code>immerse-deck.json</code>，
+資料改動後約 30 秒自動上傳，每次上傳是一個 commit（天然有版本史）。<strong>API key 與
+token 永遠不會進入上傳內容</strong>。設定步驟見 repo 的 <code>docs/github-sync.md</code>；
+Google Drive 後端保留於程式中，要切回改 <code>bg.js</code> 的 <code>BACKEND</code>。</p>
+
 <h3>Export</h3>
 <p id="count">…</p>
 <button id="export">Export CSV</button>

@@ -104,6 +104,60 @@ function wire() {
     setTimeout(() => (msg.textContent = ""), 1500);
   });
 
+  // --- cloud sync (GitHub) ---
+  const ghRepo = document.getElementById("ghRepo");
+  const ghToken = document.getElementById("ghToken");
+  const ghMsg = document.getElementById("ghMsg");
+  chrome.storage.local.get(["ghRepo", "ghToken"]).then((r) => {
+    if (r.ghRepo) ghRepo.value = r.ghRepo;
+    if (r.ghToken) ghToken.placeholder = `saved (…${r.ghToken.slice(-4)}) — type a new one to replace`;
+  });
+  document.getElementById("gh").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const patch = {};
+    if (ghRepo.value.trim()) patch.ghRepo = ghRepo.value.trim();
+    if (ghToken.value.trim()) patch.ghToken = ghToken.value.trim(); // empty must not wipe a saved token
+    if (!Object.keys(patch).length) return (ghMsg.textContent = "先填 repo 或 token");
+    await chrome.storage.local.set(patch);
+    if (patch.ghToken) {
+      ghToken.value = "";
+      ghToken.placeholder = `saved (…${patch.ghToken.slice(-4)}) — type a new one to replace`;
+    }
+    ghMsg.textContent = "saved";
+    setTimeout(() => (ghMsg.textContent = ""), 1500);
+  });
+
+  const sMsg = document.getElementById("syncStatus");
+  const send = (type) => new Promise((ok) => chrome.runtime.sendMessage({ type }, ok));
+  function paintSync(sync = {}) {
+    const when = sync.lastPush ? new Date(sync.lastPush).toLocaleString() : "—";
+    sMsg.textContent = sync.on
+      ? `已連結，上次上傳：${when}${sync.lastError ? `（上次錯誤：${sync.lastError}）` : ""}`
+      : sync.lastError
+        ? `未啟用（${sync.lastError}）`
+        : "未連結。";
+    document.getElementById("syncConnect").hidden = !!sync.on;
+    for (const id of ["syncNow", "syncRestore", "syncOff"])
+      document.getElementById(id).hidden = !sync.on;
+  }
+  chrome.storage.local.get("sync").then(({ sync }) => paintSync(sync));
+  chrome.storage.onChanged.addListener((ch, area) => {
+    if (area === "local" && ch.sync) paintSync(ch.sync.newValue);
+  });
+  document.getElementById("syncConnect").addEventListener("click", async () => {
+    sMsg.textContent = "連結中…";
+    const r = await send("sync-connect");
+    if (!r?.ok) sMsg.textContent = `連結失敗：${r?.error ?? "未知錯誤"}`;
+  });
+  document.getElementById("syncNow").addEventListener("click", () => send("sync-now"));
+  document.getElementById("syncRestore").addEventListener("click", async () => {
+    // Restore overwrites local data — the one destructive act on this page, so it asks first.
+    if (!confirm("用雲端的 deck 覆蓋本機資料？本機未上傳的變更會遺失。")) return;
+    const r = await send("sync-restore");
+    if (!r?.ok) sMsg.textContent = `還原失敗：${r?.error ?? "未知錯誤"}`;
+  });
+  document.getElementById("syncOff").addEventListener("click", () => send("sync-off"));
+
   document.getElementById("export").addEventListener("click", async () => {
     const { words = [] } = await chrome.storage.local.get("words");
     if (!words.length) return (count.textContent = "nothing saved yet");

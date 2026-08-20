@@ -68,7 +68,11 @@
   #chead a { color: inherit; text-decoration: none }
   #stamp { background: #f0f0f0; border-radius: 5px; padding: 1px 7px; font-size: 12px }
   #chead label { margin-left: auto; display: flex; align-items: center; gap: 6px; cursor: pointer }
-  #skip, #quit { padding: 4px 10px; font-size: 12px; color: var(--dim); border-radius: 6px }
+  #skip, #quit, #master { padding: 4px 10px; font-size: 12px; color: var(--dim); border-radius: 6px }
+  #master { color: #2f7d51; border-color: #cde5d5 }
+  #sessKnown { background: #e9f7ee; color: #2f7d51; border-radius: 999px; padding: 3px 10px;
+               font-size: 12px }
+  #sessKnown:empty { display: none }
   #front { font-size: 34px; font-weight: 700; text-align: center; margin: 34px 0 22px }
   #front button, #ctx button { background: none; border: 0; cursor: pointer; font-size: 17px;
                                padding: 0 4px; vertical-align: middle }
@@ -83,11 +87,13 @@
            margin: 12px 0 }
   #context { font-size: 13px; color: #888 }
   #back { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 18px }
-  #link { display: block; margin-top: 8px; font-size: 13px }
   #grades { display: flex; gap: 12px; margin-top: 26px; justify-content: center }
   #grades button { min-width: 150px; padding: 12px }
   #again { color: #c0392b; border-color: #eccac4 }
-  kbd { font-size: 11px; color: #aaa }
+  /* Keycap look, not plain digits: 「已掌握 3」 was read as "mastered: 3 words" — a shortcut
+     hint has to be unmistakably a key. */
+  kbd { font-size: 10px; color: #999; border: 1px solid #ddd; border-bottom-width: 2px;
+        border-radius: 4px; padding: 0 4px; background: #f7f7f7; font-family: inherit }
 
   /* ---- 數據分析 ---- */
   .ranges { display: flex; gap: 2px; float: right; margin-top: -46px }
@@ -205,6 +211,17 @@
     <h3>按影片複習</h3>
     <div id="videos"></div>
 
+    <div id="debtSec" hidden>
+      <h3>🧹 單字負債</h3>
+      <div class="panel">
+        <div class="vmeta" id="debtMeta" style="margin-bottom:10px"></div>
+        <div id="debtList"></div>
+        <button id="debtAll" class="b"
+          style="margin-top:10px;font-size:12px;padding:6px 14px;color:#a33;border-color:#e5c5c5">
+          全部清理</button>
+      </div>
+    </div>
+
     <p class="hint">詞彙只在你於影片上按下「學習中」或「已掌握」時才進到這裡；點字查詢不會加入。</p>
     <button id="clear" class="b">清空詞彙庫</button>
   </section>
@@ -215,6 +232,8 @@
       <span id="stamp"></span>
       <label><input type="checkbox" id="recall" /> 主動回憶</label>
       <span id="left"></span>
+      <span id="sessKnown"></span>
+      <button id="master" class="b" title="這個字其實已經會了：移出排程，不用回影片再標">已掌握 <kbd>3</kbd></button>
       <button id="skip" class="b" title="稍後再看這張，不影響排程">跳過 <kbd>→</kbd></button>
       <button id="quit" class="b" title="離開複習">✕ <kbd>esc</kbd></button>
     </div>
@@ -225,7 +244,6 @@
       <p id="contextZh"></p>
       <p id="context"></p>
       <div id="senses"></div>
-      <a id="link" target="_blank"></a>
     </div>
     <div id="grades">
       <button id="reveal" class="b">顯示解釋 <kbd>space</kbd></button>

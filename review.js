@@ -142,6 +142,14 @@ const masteredSince = (words, since) =>
   words.filter((w) => w.suspended && (w.knownAt ?? 0) >= since).length;
 const addedSince = (words, since) => words.filter((w) => (w.addedAt ?? 0) >= since).length;
 
+// zeroStudy's 單字負債: still 學習中, never reviewed once, marked more than `days` ago. Words
+// like that are promises the queue keeps making and the user keeps not keeping — dead weight
+// that inflates 待複習 forever. Surfacing them for cleanup keeps the due count honest.
+// A row with no addedAt (the earliest schema) counts as old: its age is unknown, but "never
+// reviewed after all this time" is the signal that matters.
+const debtOf = (words, now = Date.now(), days = 30) =>
+  words.filter((w) => !w.suspended && !(w.reviews > 0) && (w.addedAt ?? 0) <= now - days * DAY);
+
 // Split a sentence around the target so the card can highlight it in place. Recall works from the
 // phrase as it was heard, in its own sentence — a bare headword tests recognition, not retrieval.
 function markTarget(sentence, word) {
@@ -177,6 +185,7 @@ function wire() {
     return e;
   };
   let words = [];
+  let marks = {};
   let log = {};
   let queue = [];
   let card = null;
@@ -184,7 +193,14 @@ function wire() {
   let immLog = {};
   let total = 0;
   let done = 0;
+  let mastered = 0; // 已掌握 presses this session — shown live so the press visibly counts
   let relearned = new Set(); // ids re-queued this session, so one miss cannot loop forever
+  // Every words-write from this page goes through one chain. grade/master/drop each
+  // read-modify-write the whole array, and with hundreds of words a storage round-trip is slow
+  // enough that two rapid keyboard actions (3, 3 on consecutive cards) overlap — the second
+  // read predates the first write and silently wipes it. Same fix as deck() in content.js.
+  let writeChain = Promise.resolve();
+  const chained = (fn) => (writeChain = writeChain.then(fn));
 
   function paint() {
     const now = Date.now();
@@ -252,6 +268,41 @@ function wire() {
         return c;
       }),
     );
+
+    const debt = debtOf(words, now);
+    $("debtSec").hidden = !debt.length;
+    if (debt.length) {
+      const never = words.filter((w) => !w.suspended && !(w.reviews > 0)).length;
+      $("debtMeta").textContent =
+        `${never} 個從未複習，其中 ${debt.length} 個已標記超過 30 天——多半不會再學了，清掉讓「待複習」誠實。`;
+      $("debtAll").textContent = `全部清理 (${debt.length})`;
+      $("debtList").replaceChildren(
+        ...debt.map((w) => {
+          const r = el("div", "lrow");
+          const age = w.addedAt ? `${Math.floor((now - w.addedAt) / DAY)} 天前標記` : "早期資料";
+          const x = el("button", "idel", "✕");
+          x.title = "從詞彙庫移除";
+          x.addEventListener("click", () => drop([w.id]));
+          r.append(el("span", null, w.word), el("span", "lcount", `${w.title ?? ""} · ${age}`), x);
+          return r;
+        }),
+      );
+    }
+  }
+
+  // Deck rows and caption marks always move together, same as the library's delete — an orphaned
+  // mark would keep painting the word as 學習中 in videos with nothing behind it. Reads fresh at
+  // write time: this tab's copy may be hours stale, and removing a few ids must not also erase
+  // every word marked since the page loaded.
+  function drop(ids) {
+    return chained(async () => {
+      const r = await chrome.storage.local.get(["words", "marks"]);
+      words = (r.words ?? []).filter((w) => !ids.includes(w.id));
+      marks = r.marks ?? {};
+      for (const id of ids) delete marks[id];
+      await chrome.storage.local.set({ words, marks });
+      paint();
+    });
   }
 
   function run(pool) {
@@ -259,6 +310,8 @@ function wire() {
     if (!queue.length) return;
     total = queue.length;
     done = 0;
+    mastered = 0;
+    $("sessKnown").textContent = "";
     relearned = new Set();
     $("home").hidden = true;
     $("card").hidden = false;
@@ -316,18 +369,25 @@ function wire() {
         el("div", "sense", [`${s.pos} ${s.gloss}`, s.example, s.zh].filter(Boolean).join("\n")),
       ),
     );
-    const url = card.videoId ? `https://youtu.be/${card.videoId}?t=${Math.floor(card.t ?? 0)}` : "";
-    $("link").href = url;
-    $("link").textContent = url ? "回到影片那一刻" : "";
+    // 回到影片那一刻 lives in the header (the ▶ title link) — it used to be duplicated here too.
   }
 
   function grade(q) {
     const now = Date.now();
     Object.assign(card, schedule(card, q, now));
-    const at = words.findIndex((w) => w.id === card.id);
-    if (at >= 0) words[at] = card;
     log[dayKey(now)] = (log[dayKey(now)] ?? 0) + 1;
-    chrome.storage.local.set({ words, log });
+    // Write against a fresh read, replacing only this card's row. This page sits open in a
+    // background tab for hours, so its in-memory copy is reliably stale — writing the whole
+    // array here used to wipe every word marked on a video since the page loaded ("已掌握
+    // sometimes doesn't stick").
+    const row = { ...card, updatedAt: now };
+    chained(async () => {
+      const { words: fresh = [] } = await chrome.storage.local.get("words");
+      const at = fresh.findIndex((w) => w.id === row.id);
+      if (at >= 0) fresh[at] = row; // deleted meanwhile in another tab: stays deleted
+      words = fresh;
+      await chrome.storage.local.set({ words: fresh, log });
+    });
     done += 1;
     // A word you just got wrong comes back a few cards later in this same session. Ending a
     // review having only ever failed an item is the one thing spacing cannot repair. Its
@@ -341,13 +401,26 @@ function wire() {
     next();
   }
 
-  chrome.storage.local.get(["words", "log", "recall", "immersion", "immLog"]).then((r) => {
+  chrome.storage.local.get(["words", "marks", "log", "recall", "immersion", "immLog"]).then((r) => {
     words = r.words ?? [];
+    marks = r.marks ?? {};
     log = r.log ?? {};
     immersion = r.immersion ?? 0;
     immLog = r.immLog ?? {};
     $("recall").checked = !!r.recall;
     paint();
+  });
+
+  // A dashboard left open in a background tab must not go stale: marks made on videos arrive
+  // here as storage events. Mid-review the repaint waits — numbers moving under the card is noise.
+  chrome.storage.onChanged?.addListener((ch, area) => {
+    if (area !== "local") return;
+    if (ch.words) words = ch.words.newValue ?? [];
+    if (ch.marks) marks = ch.marks.newValue ?? {};
+    if (ch.log) log = ch.log.newValue ?? {};
+    if (ch.immLog) immLog = ch.immLog.newValue ?? {};
+    if (ch.immersion) immersion = ch.immersion.newValue ?? 0;
+    if ($("card").hidden) paint();
   });
   $("recall").addEventListener("change", (e) => {
     chrome.storage.local.set({ recall: e.target.checked });
@@ -373,6 +446,11 @@ function wire() {
   }
 
   $("start").addEventListener("click", () => run(words));
+  $("debtAll").addEventListener("click", () => {
+    const debt = debtOf(words);
+    if (!confirm(`清理 ${debt.length} 個單字？將從詞彙庫移除，無法復原。`)) return;
+    drop(debt.map((w) => w.id));
+  });
   $("reveal").addEventListener("click", reveal);
   // Deleting is irreversible and there is no undo, so it asks first.
   $("clear").addEventListener("click", async () => {
@@ -395,10 +473,40 @@ function wire() {
     next();
   };
 
+  // 已掌握 from the card itself: realising mid-review that a word is already known used to mean
+  // going back to a video to press the button there. Suspends the card (kept in the library,
+  // never scheduled again) and syncs the caption mark, with the same fresh-read write as grade().
+  function master() {
+    if (!card) return;
+    card.suspended = true;
+    card.knownAt = Date.now();
+    const row = { ...card, updatedAt: Date.now() };
+    chained(async () => {
+      const { words: fresh = [], marks: m = {} } = await chrome.storage.local.get(["words", "marks"]);
+      const at = fresh.findIndex((w) => w.id === row.id);
+      if (at >= 0) fresh[at] = row;
+      m[row.id] = "known";
+      words = fresh;
+      marks = m;
+      await chrome.storage.local.set({ words: fresh, marks: m });
+    });
+    // A same-session relearn copy of this card must not resurface either.
+    const before = queue.length;
+    queue = queue.filter((w) => w.id !== card.id);
+    total -= before - queue.length;
+    done += 1;
+    // Instant feedback on the card itself — the dashboard's numbers are invisible mid-session,
+    // and a press that changes nothing on screen reads as a press that didn't register.
+    mastered += 1;
+    $("sessKnown").textContent = `✓ 已掌握 +${mastered}`;
+    next();
+  }
+
   // Two grades rather than four, as in the reference design. ponytail: SM-2 can use the finer
   // 模糊/簡單 steps, so scheduling is slightly coarser now; add them back if intervals feel blunt.
   $("again").addEventListener("click", () => grade(0));
   $("got").addEventListener("click", () => grade(4));
+  $("master").addEventListener("click", master);
   $("skip").addEventListener("click", skip);
   $("quit").addEventListener("click", quit);
   document.addEventListener("keydown", (e) => {
@@ -408,10 +516,11 @@ function wire() {
     if (e.key === " ") return (e.preventDefault(), $("reveal").hidden ? null : reveal());
     if (e.key === "1") grade(0);
     if (e.key === "2") grade(4);
+    if (e.key === "3") master();
   });
 }
 
 if (typeof document !== "undefined") wire();
 if (typeof module !== "undefined")
-  module.exports = { schedule, stats, forecast, isDue, buildQueue, streakOf, byVideo,
+  module.exports = { schedule, stats, forecast, isDue, buildQueue, streakOf, byVideo, debtOf,
     markTarget, todayMins, masteredSince, addedSince, dayKeys, dayKey, recallOf, dueAt, GOAL_MIN };
