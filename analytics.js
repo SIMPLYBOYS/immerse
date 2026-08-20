@@ -178,11 +178,14 @@ function wireStats() {
   }
 
   const load = () =>
-    chrome.storage.local.get(["words", "immLog", "log", "immByVideo"]).then((r) => {
+    chrome.storage.local.get(["words", "immLog", "log", "immByVideo", "cloud"]).then((r) => {
+      // This screen only ever reads, so the other devices' tallies can be folded in right here.
+      // review.js cannot do the same — it writes these keys back, and they must stay ours alone.
+      const c = r.cloud ?? {};
       words = r.words ?? [];
-      immLog = r.immLog ?? {};
-      log = r.log ?? {};
-      immByVideo = r.immByVideo ?? {};
+      immLog = sumCounts(r.immLog, c.immLog);
+      log = sumCounts(r.log, c.log);
+      immByVideo = sumCounts(r.immByVideo, c.immByVideo);
       paint();
     });
 

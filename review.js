@@ -186,6 +186,13 @@ function wire() {
   };
   let words = [];
   let marks = {};
+  // Other devices' tallies, kept apart from ours on purpose. `log`, `immLog` and `immersion` are
+  // OURS — they are what gets pushed as this device's contribution — so the merged number may
+  // only ever be built for display, never written back. Doing otherwise re-uploads the phone's
+  // minutes as if we had watched them, and the fold doubles them again on the next pull.
+  let cloud = {};
+  const allLog = () => sumCounts(log, cloud.log);
+  const allImmLog = () => sumCounts(immLog, cloud.immLog);
   let log = {};
   let queue = [];
   let card = null;
@@ -214,16 +221,18 @@ function wire() {
         ? "今天沒有待複習的詞彙。"
         : "詞彙庫是空的。在影片上按「學習中」把詞加進來。";
     // The streak that matters is the immersion habit, not the reviewing — reviewing follows it.
-    const mins = todayMins(immLog, now);
+    const seenImm = allImmLog();
+    const mins = todayMins(seenImm, now);
     $("goalMins").textContent = mins;
     $("goalOf").textContent = `${mins} / ${GOAL_MIN} mins`;
     $("goalBar").style.width = `${Math.min(100, (mins / GOAL_MIN) * 100)}%`;
     $("goalHint").textContent =
       mins >= GOAL_MIN ? "今天已達標" : `再 ${GOAL_MIN - mins} 分鐘即可達成目標`;
-    $("goalStreak").textContent = `🔥 連續達標 ${streakOf(immLog, now, GOAL_MIN * 60)} 天`;
-    $("today").textContent = `✓ 今日複習 ${log[dayKey(now)] ?? 0} 詞`;
+    $("goalStreak").textContent = `🔥 連續達標 ${streakOf(seenImm, now, GOAL_MIN * 60)} 天`;
+    $("today").textContent = `✓ 今日複習 ${allLog()[dayKey(now)] ?? 0} 詞`;
     // The denominator of the ten-marks-per-hour rule, so the warning in the popup has a meaning.
-    $("imm").textContent = `⏱ 累計沉浸 ${Math.floor(immersion / 3600)}h ${Math.floor((immersion % 3600) / 60)}m`;
+    const seenTotal = (immersion ?? 0) + (cloud.immersion ?? 0);
+    $("imm").textContent = `⏱ 累計沉浸 ${Math.floor(seenTotal / 3600)}h ${Math.floor((seenTotal % 3600) / 60)}m`;
     $("total").textContent = s.learning + s.known;
     $("weekKnown").textContent = masteredSince(words, now - 7 * DAY);
     $("weekAdded").textContent = addedSince(words, now - 7 * DAY);
@@ -410,12 +419,15 @@ function wire() {
     next();
   }
 
-  chrome.storage.local.get(["words", "marks", "log", "recall", "immersion", "immLog"]).then((r) => {
+  chrome.storage.local
+    .get(["words", "marks", "log", "recall", "immersion", "immLog", "cloud"])
+    .then((r) => {
     words = r.words ?? [];
     marks = r.marks ?? {};
     log = r.log ?? {};
     immersion = r.immersion ?? 0;
     immLog = r.immLog ?? {};
+    cloud = r.cloud ?? {};
     $("recall").checked = !!r.recall;
     paint();
   });
@@ -429,6 +441,8 @@ function wire() {
     if (ch.log) log = ch.log.newValue ?? {};
     if (ch.immLog) immLog = ch.immLog.newValue ?? {};
     if (ch.immersion) immersion = ch.immersion.newValue ?? 0;
+    if (ch.cloud) cloud = ch.cloud.newValue ?? {};
+    if (ch.sync) showSync(ch.sync.newValue);
     if ($("card").hidden) paint();
   });
   $("recall").addEventListener("change", (e) => {
@@ -453,6 +467,35 @@ function wire() {
       document.dispatchEvent(new CustomEvent("im-view", { detail: b.dataset.view }));
     });
   }
+
+  // Sync lives here, not only in the options page: the toolbar icon opens THIS screen, and a
+  // button nobody can find is a button that does not exist. Everything is automatic anyway —
+  // this is for the moments you want to know now rather than within five minutes.
+  const showSync = (sy = {}) => {
+    $("syncInfo").textContent = sy.lastError
+      ? `同步錯誤：${sy.lastError}`
+      : sy.on
+        ? `已連結 · 上次上傳 ${sy.lastPush ? new Date(sy.lastPush).toLocaleTimeString() : "—"}`
+        : "未連結（在選項頁設定 repo 與 token）";
+  };
+  chrome.storage.local.get("sync").then((r) => showSync(r.sync));
+
+  $("syncGo").addEventListener("click", async () => {
+    const btn = $("syncGo");
+    btn.disabled = true;
+    $("syncInfo").textContent = "同步中…";
+    // Up before down, always: a pull folds what is in the repo, so anything not yet uploaded
+    // would simply not be part of the answer.
+    const up = await chrome.runtime.sendMessage({ type: "sync-now" });
+    const down = await chrome.runtime.sendMessage({ type: "sync-restore" });
+    btn.disabled = false;
+    if (!up?.ok || !down?.ok) {
+      $("syncInfo").textContent = `同步失敗：${up?.error ?? down?.error ?? "未知錯誤"}`;
+      return;
+    }
+    // The restore rewrote storage, so onChanged has already refreshed the numbers behind this.
+    $("syncInfo").textContent = `已同步 ${down.devices ?? 1} 台裝置 · ${down.words ?? 0} 個詞彙`;
+  });
 
   $("start").addEventListener("click", () => run(words));
   $("debtAll").addEventListener("click", () => {

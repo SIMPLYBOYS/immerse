@@ -64,9 +64,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
 // ---- cloud sync (GitHub active / Google Drive dormant) ------------------------------------------
 // Learning data only — the API key and the sync token never leave the machine. Each device owns
 // one file and writes nothing else, so a conflict is not resolved but structurally impossible;
-// merge.js folds the files on the way in. Upload is automatic (30s after a change settles),
-// download is a deliberate button press.
-// ponytail: restore is manual. Auto pull-fold on open is worth it once a second writer exists.
+// merge.js folds the files on the way in. Upload is automatic (30s after a change settles) and
+// download every five minutes, so two devices converge without anyone pressing anything.
 const SYNC_KEYS = ["words", "marks", "log", "immLog", "immByVideo", "immersion", "deleted"];
 const SYNC_FILE = "immerse-deck.json";
 
@@ -125,11 +124,17 @@ const snapshot = async () => {
   return JSON.stringify({ v: 2, at: Date.now(), dev: await deviceId(), ...data });
 };
 
-const applySnapshot = async (snap) => {
+// Rows only. The counters in a folded snapshot are everyone's added together, and these keys are
+// exactly what this device pushes as ITS OWN contribution — writing the merged total here would
+// hand back every other device's minutes as if we had watched them, and the error would double on
+// every sync rather than settle. Other devices' tallies live in `cloud`, added only for display.
+const applyRows = async (snap) => {
   if (!Array.isArray(snap.words)) throw new Error("雲端檔案裡沒有 deck");
-  const picked = {};
-  for (const k of SYNC_KEYS) if (snap[k] !== undefined) picked[k] = snap[k];
-  await chrome.storage.local.set(picked);
+  await chrome.storage.local.set({
+    words: snap.words,
+    marks: snap.marks ?? {},
+    deleted: snap.deleted ?? {},
+  });
   return snap.words.length;
 };
 
@@ -158,7 +163,7 @@ async function driveRestore() {
     const tok = await token(true);
     const id = await fileId(tok);
     const snap = await drive(`/drive/v3/files/${id}?alt=media`, { tok });
-    const n = await applySnapshot(snap);
+    const n = await applyRows(snap);
     await setSync({ on: true, fileId: id, lastError: null });
     return { ok: true, words: n };
   } catch (e) {
@@ -308,8 +313,10 @@ async function ghPush(interactive = false) {
 async function ghRestore() {
   try {
     const { ghToken, ghRepo } = await ghCfg();
+    const mine = await GH_FILE();
     const files = (await ghList(ghRepo, ghToken)).filter((f) => DECK_RE.test(f.name));
     if (!files.length) throw new Error("雲端還沒有 deck 檔");
+    let own = null; // this device's own file, needed to tell our contribution from everyone's
     // Raw media type: works at any file size, unlike the JSON form.
     const snaps = await Promise.all(
       files.map(async (f) => {
@@ -318,13 +325,30 @@ async function ghRestore() {
         });
         if (!r.ok) return null; // one unreadable device file must not sink the restore
         try {
-          return JSON.parse(await r.text());
+          const snap = JSON.parse(await r.text());
+          if (f.name === mine) own = snap;
+          return snap;
         } catch {
           return null;
         }
       }),
     );
-    const n = await applySnapshot(foldSnapshots(snaps.filter(Boolean)));
+    // Local rows join the fold as one more snapshot, so anything marked since the last push is
+    // merged rather than overwritten — a pull must never cost work that has not been uploaded.
+    const local = await chrome.storage.local.get(["words", "deleted"]);
+    const folded = foldSnapshots([
+      ...snaps.filter(Boolean),
+      { words: local.words ?? [], deleted: local.deleted ?? {} },
+    ]);
+    const n = await applyRows(folded);
+    await chrome.storage.local.set({
+      cloud: {
+        log: diffCounts(folded.log, own?.log),
+        immLog: diffCounts(folded.immLog, own?.immLog),
+        immByVideo: diffCounts(folded.immByVideo, own?.immByVideo),
+        immersion: Math.max(0, (folded.immersion ?? 0) - (own?.immersion ?? 0)),
+      },
+    });
     await setSync({ on: true, lastError: null, devices: files.length });
     return { ok: true, words: n, devices: files.length };
   } catch (e) {
@@ -346,7 +370,21 @@ chrome.storage.onChanged.addListener((ch, area) => {
     if (sync?.on) chrome.alarms.create("im-push", { delayInMinutes: 0.5 });
   });
 });
-chrome.alarms.onAlarm.addListener((a) => a.name === "im-push" && syncNow());
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === "im-push") return syncNow();
+  if (a.name === "im-pull") return pullIfOn();
+});
+
+// The other half of the loop. Uploading on its own only ever made this device's work visible
+// elsewhere; without a matching pull, a word marked on the phone sat in the repo until somebody
+// remembered to press 從雲端還原. A pull is safe to run unattended now that it merges local rows
+// into the fold instead of overwriting them, and leaves this device's own counters alone.
+async function pullIfOn() {
+  const { sync } = await chrome.storage.local.get("sync");
+  if (!sync?.on) return;
+  await restore();
+}
+chrome.alarms.create("im-pull", { periodInMinutes: 5 });
 
 // Tokens are recorded here; the money is worked out in options.js, where the price table lives.
 // Keeping prices out of this file means a model change can't leave a stale rate behind in two

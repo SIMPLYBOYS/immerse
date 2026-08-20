@@ -28,7 +28,7 @@ const { schedule, stats, forecast, isDue, recallOf, buildQueue, streakOf, byVide
 const { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches } =
   require("./analytics.js");
 const { searchWords, filterWords, dueLabel, groupWords } = require("./library.js");
-const { foldSnapshots, pruneDeleted } = require("./merge.js");
+const { foldSnapshots, pruneDeleted, sumCounts, diffCounts } = require("./merge.js");
 const { b64 } = require("./app/src/cloud.js");
 
 // --- SM-2 ---
@@ -371,6 +371,18 @@ for (const sample of [
 ]) {
   assert.equal(b64(sample), Buffer.from(sample, "utf8").toString("base64"), `b64: ${sample}`);
 }
+
+// --- counter arithmetic: a device stores its own tallies and everyone else's apart, so that
+// writing the merged total back into its own file cannot make the sum compound on every sync ---
+assert.deepEqual(sumCounts({ a: 1, b: 2 }, { b: 3, c: 4 }), { a: 1, b: 5, c: 4 });
+assert.deepEqual(sumCounts(undefined, { a: 1 }), { a: 1 });
+assert.deepEqual(diffCounts({ a: 10, b: 5 }, { a: 4 }), { a: 6, b: 5 });
+// A key we alone contributed leaves nothing behind for anyone else.
+assert.deepEqual(diffCounts({ a: 7 }, { a: 7 }), {});
+// A fold older than our last push can look negative; it must never be subtracted from a display.
+assert.deepEqual(diffCounts({ a: 3 }, { a: 9 }), {});
+// The round trip is what the sync relies on: others + ours == the folded total.
+assert.deepEqual(sumCounts(diffCounts({ d1: 900 }, { d1: 300 }), { d1: 300 }), { d1: 900 });
 
 // Tombstones expire, or the file grows forever.
 assert.deepEqual(pruneDeleted({ old: T0 - 100 * DAY, recent: T0 - DAY }, T0), { recent: T0 - DAY });

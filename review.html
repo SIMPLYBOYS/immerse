@@ -60,6 +60,10 @@
   .vfill { height: 100%; border-radius: 3px; background: var(--green) }
   .vmeta { font-size: 11px; color: var(--dim) }
   .hint { font-size: 12px; color: var(--dim); margin-top: 28px }
+  .syncrow { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+             margin-top: 30px; padding: 12px 14px; background: #fff; border: 1px solid var(--line);
+             border-radius: 10px; font-size: 12px; color: var(--dim) }
+  .syncrow button { font-size: 12px; padding: 6px 14px }
   #clear { font-size: 12px; padding: 5px 12px; color: #a33; border-color: #e5c5c5 }
 
   /* ---- 複習卡 ---- */
@@ -222,6 +226,11 @@
       </div>
     </div>
 
+    <div class="syncrow">
+      <span id="syncInfo">同步：—</span>
+      <button id="syncGo" class="b">立即同步</button>
+    </div>
+
     <p class="hint">詞彙只在你於影片上按下「學習中」或「已掌握」時才進到這裡；點字查詢不會加入。</p>
     <button id="clear" class="b">清空詞彙庫</button>
   </section>
@@ -339,6 +348,7 @@
   <div id="list"></div>
 </section>
 
+<script src="merge.js"></script>
 <script src="review.js"></script>
 <script src="analytics.js"></script>
 <script src="library.js"></script>
