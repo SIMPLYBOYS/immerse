@@ -213,19 +213,16 @@ function start_() {
       const delta = state.imm - state.immSaved;
       state.immSaved = state.imm;
       // Two shapes on purpose: `immersion` is a monotonic clock the mark-rate budget measures
-      // against, `immLog` is per-day and is what the daily goal reads.
+      // against, `immLog` is per-day and is what the daily goal reads. Both are added up by the
+      // worker rather than here: several tabs can be watching at once, and a read-modify-write
+      // per tab loses one tab's seconds every flush.
       const day = new Date();
       const key = `${day.getFullYear()}-${day.getMonth() + 1}-${day.getDate()}`;
-      // ponytail: read-modify-write, so two YouTube tabs open at once can lose a few seconds.
       const vid = new URLSearchParams(location.search).get("v");
-      getStore(["immersion", "immLog", "immByVideo"]).then(
-        ({ immersion = 0, immLog = {}, immByVideo = {} }) => {
-          immLog[key] = (immLog[key] ?? 0) + delta;
-          // Per-video too, so "words per hour" can be answered for one video and not just overall.
-          if (vid) immByVideo[vid] = (immByVideo[vid] ?? 0) + delta;
-          setStore({ immersion: immersion + delta, immLog, immByVideo });
-        },
-      );
+      // askOnce, not ask: ask retries a closed channel, and retrying an "add this much" message
+      // can apply it twice. At-most-once is the right trade for a counter — a dropped flush costs
+      // a few seconds, while an inflated one lies to the daily goal and the mark-rate budget.
+      askOnce({ type: "imm", delta, day: key, videoId: vid });
     }
   }
 
@@ -553,8 +550,16 @@ function start_() {
   // rather than creating a duplicate card.
   // Writes are chained one at a time: deck is a read-modify-write, and two in flight at once —
   // a fresh mark racing the explain-reply backfill — silently lose the earlier one.
+  // Resolves either way: a rejected link would poison the chain and silently stop every later
+  // mark — the same failure mode that killed the immersion clock.
   let deckChain = Promise.resolve();
-  const deck = (item, how) => (deckChain = deckChain.then(() => deckWrite(item, how)));
+  const deck = (item, how) =>
+    (deckChain = deckChain.then(() =>
+      deckWrite(item, how).catch((e) => {
+        console.warn("[immerse] deck write failed", e);
+        return []; // callers read a word list; an empty one just means "no budget warning"
+      }),
+    ));
   async function deckWrite(item, how) {
     const { words = [], deleted = {} } = await getStore(["words", "deleted"]);
     const id = item.word.toLowerCase();

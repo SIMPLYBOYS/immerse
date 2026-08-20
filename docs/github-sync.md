@@ -54,8 +54,8 @@ repo 裡不是一個檔案，而是每台裝置一個：`deck-ext-a1b2c3d4.json`
 - **安全性**：token 跟 API key 一樣以明文存在 `chrome.storage.local`——能讀這個
   Chrome profile 的東西都讀得到。它的權限被限制在那一個 repo 的內容讀寫，最壞情況的
   爆炸半徑就是那個 repo。
-- **未來的 app 版**：讀寫同一個 repo 檔案即可；每筆字已帶 `updatedAt`，屆時升級為
-  逐字合併。
+- **未來的 app 版**：寫自己的 `deck-app-xxxxxxxx.json`，遵守三條約定——每筆字蓋
+  `updatedAt`、計數器只記自己那台的量、刪除留墓碑。合併規則見上表與 `merge.js`。
 
 ## 已知上限（ponytail）
 

@@ -77,7 +77,36 @@ const JOBS = {
   "sync-now": () => syncNow(true),
   "sync-restore": () => restore(),
   "sync-off": () => setSync({ on: false }).then(() => ({ ok: true })),
+  // The immersion clock is one counter that several tabs increment at once. A content script
+  // doing its own read-modify-write meant two tabs flushing together read the same total and
+  // wrote it back twice, losing one tab's seconds every 15s. The worker owns it now, and chains
+  // the writes so its own concurrent callers cannot race either.
+  imm: (m) => addImmersion(m),
 };
+
+// Each link resolves whatever happens. `chain.then(fn)` on a REJECTED promise never runs fn and
+// hands back the same old rejection forever, so a single failed write — a quota error, a worker
+// torn down mid-write — would silently stop the clock for good rather than for one flush. That
+// is exactly how this counter died once already.
+let immChain = Promise.resolve();
+const addImmersion = (m) =>
+  (immChain = immChain.then(async () => {
+    try {
+      const delta = Number(m.delta) || 0;
+      if (delta <= 0) return { ok: true };
+      const r = await chrome.storage.local.get(["immersion", "immLog", "immByVideo"]);
+      const immLog = r.immLog ?? {};
+      const immByVideo = r.immByVideo ?? {};
+      immLog[m.day] = (immLog[m.day] ?? 0) + delta;
+      // Per-video too, so "words per hour" can be answered for one video and not just overall.
+      if (m.videoId) immByVideo[m.videoId] = (immByVideo[m.videoId] ?? 0) + delta;
+      await chrome.storage.local.set({ immersion: (r.immersion ?? 0) + delta, immLog, immByVideo });
+      return { ok: true };
+    } catch (e) {
+      console.warn("[immerse] immersion flush failed", e);
+      return { ok: false, error: String(e?.message ?? e) };
+    }
+  }));
 
 chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   const job =
@@ -90,11 +119,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
 });
 
 // ---- cloud sync (GitHub active / Google Drive dormant) ------------------------------------------
-// A one-way mirror for now: this extension is the only writer, so the whole snapshot is pushed
-// and restore is a manual, explicit pull on the options page. The learning data only — the API
-// key never leaves the machine. Every word row already carries `updatedAt`, so when a phone app
-// becomes a second writer the upgrade path is per-row merging plus a conditional write.
-// ponytail: no conflict guard yet — single writer by construction.
+// Learning data only — the API key and the sync token never leave the machine. Each device owns
+// one file and writes nothing else, so a conflict is not resolved but structurally impossible;
+// merge.js folds the files on the way in. Upload is automatic (30s after a change settles),
+// download is a deliberate button press.
+// ponytail: restore is manual. Auto pull-fold on open is worth it once a second writer exists.
 const SYNC_KEYS = ["words", "marks", "log", "immLog", "immByVideo", "immersion", "deleted"];
 const SYNC_FILE = "immerse-deck.json";
 
@@ -315,8 +344,13 @@ async function ghRestore() {
 // Push after changes settle. A one-shot alarm survives the worker being killed between the write
 // burst and the upload — a setTimeout would die with the worker. 30s coalesces a whole review
 // session's writes into one upload.
+// The immersion counters change every 15 seconds while a video plays. Uploading on THEIR
+// account meant a commit every 15s — about 120 full-file uploads for one half-hour video. Only
+// the learning data schedules a push; the counters ride along on the next one, and a review
+// session bumps `log`, so they are never stale for long.
+const PUSH_TRIGGERS = ["words", "marks", "log", "deleted"];
 chrome.storage.onChanged.addListener((ch, area) => {
-  if (area !== "local" || !SYNC_KEYS.some((k) => ch[k])) return;
+  if (area !== "local" || !PUSH_TRIGGERS.some((k) => ch[k])) return;
   chrome.storage.local.get("sync").then(({ sync }) => {
     if (sync?.on) chrome.alarms.create("im-push", { delayInMinutes: 0.5 });
   });

@@ -199,8 +199,11 @@ function wire() {
   // read-modify-write the whole array, and with hundreds of words a storage round-trip is slow
   // enough that two rapid keyboard actions (3, 3 on consecutive cards) overlap — the second
   // read predates the first write and silently wipes it. Same fix as deck() in content.js.
+  // ...and resolves either way, so one failed write cannot silently stop every later grade:
+  // `chain.then(fn)` on a rejected promise never runs fn at all.
   let writeChain = Promise.resolve();
-  const chained = (fn) => (writeChain = writeChain.then(fn));
+  const chained = (fn) =>
+    (writeChain = writeChain.then(fn).catch((e) => console.warn("[immerse] write failed", e)));
 
   function paint() {
     const now = Date.now();
