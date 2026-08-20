@@ -556,11 +556,14 @@ function start_() {
   let deckChain = Promise.resolve();
   const deck = (item, how) => (deckChain = deckChain.then(() => deckWrite(item, how)));
   async function deckWrite(item, how) {
-    const { words = [] } = await getStore("words");
+    const { words = [], deleted = {} } = await getStore(["words", "deleted"]);
     const id = item.word.toLowerCase();
     const at = words.findIndex((w) => w.id === id);
     if (!how) {
+      // A tombstone, not just a splice: another device still holding the row would otherwise hand
+      // it straight back at the next merge. Re-marking the word later out-dates the stone.
       if (at >= 0) words.splice(at, 1);
+      deleted[id] = Date.now();
     } else {
       const row = {
         addedAt: Date.now(), // only set on first add; the spread below keeps an existing stamp
@@ -582,7 +585,7 @@ function start_() {
       if (at >= 0) words[at] = row;
       else words.push(row);
     }
-    await setStore({ words });
+    await setStore({ words, deleted });
     return words;
   }
 

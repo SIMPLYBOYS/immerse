@@ -296,11 +296,17 @@ function wire() {
   // every word marked since the page loaded.
   function drop(ids) {
     return chained(async () => {
-      const r = await chrome.storage.local.get(["words", "marks"]);
+      const r = await chrome.storage.local.get(["words", "marks", "deleted"]);
       words = (r.words ?? []).filter((w) => !ids.includes(w.id));
       marks = r.marks ?? {};
-      for (const id of ids) delete marks[id];
-      await chrome.storage.local.set({ words, marks });
+      const deleted = r.deleted ?? {};
+      // Tombstones travel with the deck, so a cleanup done here is not undone by the next merge
+      // with a device that still has the rows.
+      for (const id of ids) {
+        delete marks[id];
+        deleted[id] = Date.now();
+      }
+      await chrome.storage.local.set({ words, marks, deleted });
       paint();
     });
   }
@@ -455,8 +461,10 @@ function wire() {
   // Deleting is irreversible and there is no undo, so it asks first.
   $("clear").addEventListener("click", async () => {
     if (!confirm(`刪除全部 ${words.length} 個詞彙？無法復原。`)) return;
+    const { deleted = {} } = await chrome.storage.local.get("deleted");
+    for (const w of words) deleted[w.id] = Date.now();
     words = [];
-    await chrome.storage.local.set({ words: [], marks: {} });
+    await chrome.storage.local.set({ words: [], marks: {}, deleted });
     paint();
   });
   const quit = () => {

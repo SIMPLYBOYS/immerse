@@ -1,3 +1,5 @@
+importScripts("merge.js"); // foldSnapshots / pruneDeleted — kept separate so node can test them
+
 // All network calls live here: a service worker with host_permissions is exempt from CORS,
 // a content script is not. Set the key in the options page, or setKey("sk-ant-...") from here.
 
@@ -93,7 +95,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
 // key never leaves the machine. Every word row already carries `updatedAt`, so when a phone app
 // becomes a second writer the upgrade path is per-row merging plus a conditional write.
 // ponytail: no conflict guard yet — single writer by construction.
-const SYNC_KEYS = ["words", "marks", "log", "immLog", "immByVideo", "immersion"];
+const SYNC_KEYS = ["words", "marks", "log", "immLog", "immByVideo", "immersion", "deleted"];
 const SYNC_FILE = "immerse-deck.json";
 
 const token = (interactive) =>
@@ -147,7 +149,8 @@ const restore = () => (BACKEND === "drive" ? driveRestore() : ghRestore());
 
 const snapshot = async () => {
   const data = await chrome.storage.local.get(SYNC_KEYS);
-  return JSON.stringify({ v: 1, at: Date.now(), ...data });
+  data.deleted = pruneDeleted(data.deleted);
+  return JSON.stringify({ v: 2, at: Date.now(), dev: await deviceId(), ...data });
 };
 
 const applySnapshot = async (snap) => {
@@ -195,7 +198,20 @@ async function driveRestore() {
 // A private repo + fine-grained PAT (Contents read/write on that one repo). No OAuth consent
 // screen, no GCP — and every upload is a commit, so the deck gets version history for free.
 // The token, like the API key, lives only in local storage and is never part of the snapshot.
-const GH_FILE = "immerse-deck.json";
+// One file per device, folded together on read: a device only ever writes its own file, so two
+// writers can never overwrite each other and no locking or conflict resolution is needed on the
+// way out. `immerse-deck.json` from the single-writer era does not match this pattern and is left
+// alone as a backup — folding it in would double-count its counters against this device's file.
+const GH_FILE = async () => `deck-${await deviceId()}.json`;
+const DECK_RE = /^deck-.+\.json$/;
+
+async function deviceId() {
+  const { deviceId: id } = await chrome.storage.local.get("deviceId");
+  if (id) return id;
+  const made = `ext-${crypto.randomUUID().slice(0, 8)}`;
+  await chrome.storage.local.set({ deviceId: made });
+  return made;
+}
 
 const ghCfg = async () => {
   const { ghToken, ghRepo } = await chrome.storage.local.get(["ghToken", "ghRepo"]);
@@ -231,15 +247,17 @@ async function gh(path, { method = "GET", body, token: t } = {}) {
 
 // The file's current sha, from the ROOT DIRECTORY listing — never from GET-file, whose JSON form
 // errors once the file passes 1MB. null when the repo is empty or the file doesn't exist yet.
-const ghSha = async (repo, t) =>
-  (await gh(`/repos/${repo}/contents/`, { token: t }))?.find?.((f) => f.name === GH_FILE)?.sha;
+const ghList = async (repo, t) => (await gh(`/repos/${repo}/contents/`, { token: t })) ?? [];
+const ghSha = async (repo, t, name) =>
+  (await ghList(repo, t))?.find?.((f) => f.name === name)?.sha;
 
 async function ghPush(interactive = false) {
   try {
     const { sync = {} } = await chrome.storage.local.get("sync");
     if (!sync.on && !interactive) return { ok: false }; // never auto-run before the user opts in
     const { ghToken, ghRepo } = await ghCfg();
-    const url = `/repos/${ghRepo}/contents/${GH_FILE}`;
+    const name = await GH_FILE();
+    const url = `/repos/${ghRepo}/contents/${name}`;
     const content = b64(await snapshot());
     const put = (sha) =>
       gh(url, {
@@ -253,10 +271,11 @@ async function ghPush(interactive = false) {
       });
     let r;
     try {
-      r = await put(sync.sha ?? (await ghSha(ghRepo, ghToken)));
+      r = await put(sync.sha ?? (await ghSha(ghRepo, ghToken, name)));
     } catch {
-      // Stale sha (409/422): refresh from the directory listing and retry once.
-      r = await put(await ghSha(ghRepo, ghToken));
+      // Stale sha (409/422) on OUR OWN file: only this device writes it, so the cached sha is
+      // simply out of date (a manual edit, a reinstall). Refresh from the listing and retry.
+      r = await put(await ghSha(ghRepo, ghToken, name));
     }
     await setSync({ on: true, sha: r.content.sha, lastPush: Date.now(), lastError: null });
     return { ok: true };
@@ -269,14 +288,25 @@ async function ghPush(interactive = false) {
 async function ghRestore() {
   try {
     const { ghToken, ghRepo } = await ghCfg();
+    const files = (await ghList(ghRepo, ghToken)).filter((f) => DECK_RE.test(f.name));
+    if (!files.length) throw new Error("雲端還沒有 deck 檔");
     // Raw media type: works at any file size, unlike the JSON form.
-    const r = await fetch(`https://api.github.com/repos/${ghRepo}/contents/${GH_FILE}`, {
-      headers: { authorization: `Bearer ${ghToken}`, accept: "application/vnd.github.raw+json" },
-    });
-    if (!r.ok) throw new Error(r.status === 404 ? "雲端還沒有 deck 檔" : `HTTP ${r.status}`);
-    const n = await applySnapshot(JSON.parse(await r.text()));
-    await setSync({ on: true, lastError: null });
-    return { ok: true, words: n };
+    const snaps = await Promise.all(
+      files.map(async (f) => {
+        const r = await fetch(`https://api.github.com/repos/${ghRepo}/contents/${f.name}`, {
+          headers: { authorization: `Bearer ${ghToken}`, accept: "application/vnd.github.raw+json" },
+        });
+        if (!r.ok) return null; // one unreadable device file must not sink the restore
+        try {
+          return JSON.parse(await r.text());
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const n = await applySnapshot(foldSnapshots(snaps.filter(Boolean)));
+    await setSync({ on: true, lastError: null, devices: files.length });
+    return { ok: true, words: n, devices: files.length };
   } catch (e) {
     return { ok: false, error: String(e.message ?? e) };
   }

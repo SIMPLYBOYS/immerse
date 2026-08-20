@@ -90,11 +90,13 @@ function wireLibrary() {
   }
 
   async function remove(w) {
-    const r = await chrome.storage.local.get(["words", "marks"]);
+    const r = await chrome.storage.local.get(["words", "marks", "deleted"]);
     words = (r.words ?? []).filter((x) => x.id !== w.id);
     marks = r.marks ?? {};
     delete marks[w.id];
-    await chrome.storage.local.set({ words, marks });
+    // Tombstone, so the removal survives a merge with a device that still has the row.
+    const deleted = { ...(r.deleted ?? {}), [w.id]: Date.now() };
+    await chrome.storage.local.set({ words, marks, deleted });
     paint();
   }
 

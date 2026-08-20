@@ -28,6 +28,7 @@ const { schedule, stats, forecast, isDue, recallOf, buildQueue, streakOf, byVide
 const { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches } =
   require("./analytics.js");
 const { searchWords, filterWords, dueLabel, groupWords } = require("./library.js");
+const { foldSnapshots, pruneDeleted } = require("./merge.js");
 
 // --- SM-2 ---
 const T0 = 1_700_000_000_000;
@@ -304,6 +305,59 @@ assert.equal(
   toSentences([{ start: 0, end: 12, text: "Well, since the dawn of time, humans dreamed of flight." }]).length,
   1,
 );
+
+// --- foldSnapshots: one file per device, reconciled on read ---
+// Rows are per-word facts (newest updatedAt wins); counters are per-device tallies (summed).
+const ext = {
+  words: [
+    { id: "alpha", word: "alpha", updatedAt: 100, suspended: false },
+    { id: "beta", word: "beta", updatedAt: 300, suspended: false },
+    { id: "gone", word: "gone", updatedAt: 100 },
+  ],
+  log: { "2026-8-1": 5 },
+  immLog: { "2026-8-1": 600 },
+  immByVideo: { vid1: 600 },
+  immersion: 600,
+  deleted: {},
+};
+const app = {
+  words: [
+    { id: "alpha", word: "alpha", updatedAt: 200, suspended: true }, // reviewed later on the phone
+    { id: "beta", word: "beta", updatedAt: 150, suspended: true }, // older than the desktop's copy
+    { id: "gamma", word: "gamma", updatedAt: 50 },
+  ],
+  log: { "2026-8-1": 3 },
+  immLog: { "2026-8-1": 300, "2026-8-2": 60 },
+  immByVideo: { vid1: 300 },
+  immersion: 360,
+  deleted: { gone: 400 }, // deleted on the phone AFTER the desktop last touched it
+};
+const merged = foldSnapshots([ext, app]);
+const byId = Object.fromEntries(merged.words.map((w) => [w.id, w]));
+
+assert.equal(byId.alpha.suspended, true); // phone's newer stamp wins
+assert.equal(byId.beta.suspended, false); // desktop's newer stamp wins, per row not per file
+assert.ok(byId.gamma); // a word only one device has still arrives
+assert.ok(!byId.gone); // a tombstone newer than the row deletes it everywhere
+// Deleting then re-marking revives the word: the edit out-dates the stone.
+assert.ok(foldSnapshots([{ words: [{ id: "gone", updatedAt: 500 }] }, app]).words.some((w) => w.id === "gone"));
+// Counters sum across devices — each file holds only its own device's tally.
+assert.equal(merged.log["2026-8-1"], 8);
+assert.equal(merged.immLog["2026-8-1"], 900);
+assert.equal(merged.immLog["2026-8-2"], 60);
+assert.equal(merged.immersion, 960);
+// Re-folding the SAME snapshots must not inflate a total — that is what makes a re-push safe.
+assert.equal(foldSnapshots([ext, app]).immersion, 960);
+// marks is derived from the merged rows, never merged itself: one source of truth.
+assert.equal(merged.marks.alpha, "known");
+assert.equal(merged.marks.beta, "learning");
+assert.equal(merged.marks.gone, undefined);
+// An unreadable device file is skipped rather than sinking the whole restore.
+assert.equal(foldSnapshots([null, ext, "garbage"]).words.length, 3);
+assert.deepEqual(foldSnapshots([]).words, []);
+
+// Tombstones expire, or the file grows forever.
+assert.deepEqual(pruneDeleted({ old: T0 - 100 * DAY, recent: T0 - DAY }, T0), { recent: T0 - DAY });
 
 console.log("ok");
 
