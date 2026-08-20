@@ -334,8 +334,47 @@ function start_() {
     // cues — an empty transcript must never reach the model (the API rejects empty content,
     // and there is nothing to ask about anyway).
     if (!state.sentences.length) return;
-    loadPhrases();
-    loadPos();
+    // Save only after both land: the phrases and POS tags cost real money here, and shipping them
+    // with the transcript is what lets the phone colour and box the same text for free.
+    await Promise.all([loadPhrases(), loadPos()]);
+    saveTranscript();
+  }
+
+  // Hand the whole transcript to the worker, which files it in the repo for the phone to read.
+  // The phone cannot obtain this itself — YouTube refuses to play, and therefore to fetch its own
+  // captions, inside a mobile WebView — so the desktop, which is legitimately watching anyway,
+  // is the only place it can come from.
+  async function saveTranscript() {
+    const videoId = new URLSearchParams(location.search).get("v");
+    if (!videoId || !state.sentences.length) return;
+    // Fetch the Chinese track even when the Z line was never switched on. It is YouTube's own
+    // translation of the same URL, so it costs nothing, and it is the last chance to get it: the
+    // phone has no signed URL of its own.
+    let zhCues = state.zhCues;
+    if (!zhCues.length && state.trackUrl) zhCues = await fetchCues(state.trackUrl, "zh-Hant");
+    // The last segment's end is Infinity, which JSON turns into null. Give it a real horizon so
+    // the reader on the phone can highlight the final sentence like any other.
+    const last = state.cues[state.cues.length - 1];
+    const horizon = Number.isFinite(last?.end) ? last.end : (last?.start ?? 0) + 15;
+    const trim = (list) =>
+      list.map((x) => ({ text: x.text, start: x.start, end: Number.isFinite(x.end) ? x.end : horizon }));
+    askOnce({
+      type: "tx-save",
+      tx: {
+        v: 1,
+        videoId,
+        title: document.title.replace(/ - YouTube$/, ""),
+        at: Date.now(),
+        sentences: trim(state.sentences),
+        clauses: trim(state.clauses),
+        zh: state.sentences.map((s) => zhFor(zhCues, s)),
+        phrases: state.phrases,
+        pos: state.pos,
+      },
+    }).then((r) => {
+      if (r?.error) console.warn("[immerse] 逐字稿未存檔：", r.error);
+      else if (!r?.skipped) console.log("[immerse] 逐字稿已存入雲端", videoId);
+    });
   }
 
   // Same batch-once-per-video shape as loadPhrases. Untagged words simply render neutral, so a
@@ -1016,4 +1055,4 @@ function start_() {
 
 if (typeof document !== "undefined") start_();
 if (typeof module !== "undefined")
-  module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl, CLAUSE };
+  module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl, CLAUSE, WORD };

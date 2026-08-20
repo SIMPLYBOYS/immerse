@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "immerse",
-  "version": "3.20.2",
+  "version": "3.21.2",
   "description": "Click a word in the YouTube captions, get a definition plus an AI explanation in context.",
   "options_page": "options.html",
   "icons": {

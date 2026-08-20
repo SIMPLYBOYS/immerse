@@ -1,65 +1,7 @@
-importScripts("merge.js"); // foldSnapshots / pruneDeleted — kept separate so node can test them
+importScripts("merge.js", "prompts.js"); // kept separate so node — and the phone app — can load them
 
 // All network calls live here: a service worker with host_permissions is exempt from CORS,
 // a content script is not. Set the key in the options page, or setKey("sk-ant-...") from here.
-
-const MODEL = "claude-haiku-4-5";
-const SYSTEM = `You explain English vocabulary to an advanced learner who reads technical English \
-fluently but misses idioms, phrasal verbs, and slang.
-
-The sentence is auto-transcribed speech, so names and technical terms are often mis-heard. If the \
-word looks like a garbled version of something else, say what it most likely was and explain that. \
-Never ask a question back — nobody is there to answer it; make your best call and say so.
-
-Reply in exactly this shape and nothing else:
-
-CONTEXT: what the word means in THIS sentence. At most 3 short sentences, under 50 words. If it \
-belongs to an idiom or phrasal verb, name the whole expression and explain that instead — that is \
-usually the part worth learning.
-CONTEXT_ZH: the same explanation in 繁體中文, one line. Not a word-for-word translation of the \
-English line — write it the way you would explain it to a Chinese speaker.
-ZH: the whole given sentence translated into 繁體中文, one line.
-SENSE: <pos> | <繁體中文語意> | <short English example sentence> | <該例句的繁體中文翻譯>
-
-Give 2 to 4 SENSE lines covering the word's main uses across English, most common first — not only \
-the use in this sentence. <pos> is one of: n. v. adj. adv. prep. pron. phr.
-
-No preamble, no restating the sentence, no numbering, no markdown, no blank lines.`;
-
-const PHRASE_SYSTEM = `From an English transcript, list only the multi-word expressions whose \
-meaning an advanced learner could NOT work out from the individual words: phrasal verbs, idioms, \
-fixed expressions, slang.
-
-Include: "grew into", "ran into", "figure out", "on the fly", "up and running".
-Exclude ordinary word sequences that mean exactly what they say — "handles model downloads", \
-"click download", "run the model" — and anything that looking up one word already solves.
-
-List the expression itself, never its object or complement: "grew into", not "grew into the \
-foundation".
-
-Copy each one character for character as it appears in the transcript, keeping the inflected form \
-actually used — "grew into" if that is what the speaker said, never the dictionary form "grow \
-into". The text is matched back against the transcript, so a normalised form is discarded.
-
-Include an expression whenever a learner could plausibly misread it; leave out the ones you are \
-confident are transparent. Do not aim for a particular count either way.
-
-One per line. Nothing else: no numbering, no bullets, no commentary, no blank lines, no markdown. \
-At most 15 lines.`;
-
-const POS_SYSTEM = `Tag the verbs, nouns and adjectives in an English transcript.
-
-List EVERY distinct one that appears. This is an exhaustive labelling task, not a \
-selection task — do not pick out the interesting ones, and do not stop early. Include the \
-inflected form exactly as it appears in the text, on its own line: if the transcript says "sees", \
-"models" and "running", those are the three lines — not "see", "model", "run".
-
-One per line: the word, a single space, then one of verb, noun, adj. Lowercase the word. Use the \
-sense it carries in this transcript — if "run" is used as a verb here, tag it verb even though it \
-can be a noun elsewhere, and tag "local" in "a local model" adj rather than noun.
-
-Skip adverbs, proper names, and anything that is not clearly one of the three. Nothing else: no \
-numbering, no commentary, no markdown, no blank lines.`;
 
 globalThis.setKey = (apiKey) => chrome.storage.local.set({ apiKey });
 
@@ -82,6 +24,7 @@ const JOBS = {
   // wrote it back twice, losing one tab's seconds every 15s. The worker owns it now, and chains
   // the writes so its own concurrent callers cannot race either.
   imm: (m) => addImmersion(m),
+  "tx-save": (m) => saveTx(m.tx),
 };
 
 // Each link resolves whatever happens. `chain.then(fn)` on a REJECTED promise never runs fn and
@@ -277,8 +220,73 @@ async function gh(path, { method = "GET", body, token: t } = {}) {
 // The file's current sha, from the ROOT DIRECTORY listing — never from GET-file, whose JSON form
 // errors once the file passes 1MB. null when the repo is empty or the file doesn't exist yet.
 const ghList = async (repo, t) => (await gh(`/repos/${repo}/contents/`, { token: t })) ?? [];
-const ghSha = async (repo, t, name) =>
-  (await ghList(repo, t))?.find?.((f) => f.name === name)?.sha;
+
+// Unlike a root-only lookup, this finds a file inside a folder too — transcripts live in tx/.
+async function shaOf(repo, token, name) {
+  const cut = name.lastIndexOf("/");
+  const listing = (await gh(`/repos/${repo}/contents/${cut < 0 ? "" : name.slice(0, cut)}`, { token })) ?? [];
+  const base = name.slice(cut + 1);
+  return listing.find?.((f) => f.name === base)?.sha;
+}
+
+// Write one file, creating or replacing it. The deck and the transcripts share this: both need
+// the same "send the sha of what you are replacing" dance, and a stale sha is recoverable by
+// simply asking the directory what the current one is.
+async function ghPut(repo, token, name, body, sha) {
+  const content = b64(body);
+  const put = (s) =>
+    gh(`/repos/${repo}/contents/${name}`, {
+      method: "PUT",
+      token,
+      body: JSON.stringify({
+        message: `sync ${new Date().toISOString()}`,
+        content,
+        ...(s ? { sha: s } : {}),
+      }),
+    });
+  try {
+    return await put(sha ?? (await shaOf(repo, token, name)));
+  } catch {
+    return await put(await shaOf(repo, token, name));
+  }
+}
+
+// A transcript is content, not per-device state: one file per video, written once, never merged
+// and never summed. It goes straight to the repo instead of through chrome.storage because a few
+// dozen of them would eat the 10MB local quota the deck already lives in. `txIndex` is a small
+// local note of what this device has pushed, so re-watching a video costs nothing.
+async function saveTx(tx) {
+  try {
+    if (!tx?.videoId || !tx.sentences?.length) return { ok: false, error: "沒有逐字稿" };
+    const { sync = {}, txIndex = {}, txIndexAt } = await chrome.storage.local.get([
+      "sync",
+      "txIndex",
+      "txIndexAt",
+    ]);
+    if (!sync.on) return { ok: false, error: "同步未啟用" };
+    const { ghToken, ghRepo } = await ghCfg();
+    if (txIndex[tx.videoId]) {
+      // Nothing new to upload — but the index may never have been written (it was added after
+      // some transcripts already existed) or may have been deleted. Publish it once so the phone
+      // can see what is already there, rather than waiting for the next unseen video.
+      if (!txIndexAt) {
+        await ghPut(ghRepo, ghToken, "tx/index.json", JSON.stringify(txIndex));
+        await chrome.storage.local.set({ txIndexAt: Date.now() });
+      }
+      return { ok: true, skipped: true };
+    }
+    await ghPut(ghRepo, ghToken, `tx/${tx.videoId}.json`, JSON.stringify(tx));
+    txIndex[tx.videoId] = { title: tx.title, at: tx.at, n: tx.sentences.length };
+    await chrome.storage.local.set({ txIndex });
+    // An index beside the transcripts, so the phone can list what is available with one request
+    // instead of downloading every transcript just to read its title. Only this device writes it.
+    await ghPut(ghRepo, ghToken, "tx/index.json", JSON.stringify(txIndex));
+    await chrome.storage.local.set({ txIndexAt: Date.now() });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message ?? e) };
+  }
+}
 
 async function ghPush(interactive = false) {
   try {
@@ -286,26 +294,9 @@ async function ghPush(interactive = false) {
     if (!sync.on && !interactive) return { ok: false }; // never auto-run before the user opts in
     const { ghToken, ghRepo } = await ghCfg();
     const name = await GH_FILE();
-    const url = `/repos/${ghRepo}/contents/${name}`;
-    const content = b64(await snapshot());
-    const put = (sha) =>
-      gh(url, {
-        method: "PUT",
-        token: ghToken,
-        body: JSON.stringify({
-          message: `sync ${new Date().toISOString()}`,
-          content,
-          ...(sha ? { sha } : {}),
-        }),
-      });
-    let r;
-    try {
-      r = await put(sync.sha ?? (await ghSha(ghRepo, ghToken, name)));
-    } catch {
-      // Stale sha (409/422) on OUR OWN file: only this device writes it, so the cached sha is
-      // simply out of date (a manual edit, a reinstall). Refresh from the listing and retry.
-      r = await put(await ghSha(ghRepo, ghToken, name));
-    }
+    // A stale cached sha on OUR OWN file only ever means a manual edit or a reinstall, since no
+    // other device writes it — and ghPut recovers from that by re-reading the directory.
+    const r = await ghPut(ghRepo, ghToken, name, await snapshot(), sync.sha);
     await setSync({ on: true, sha: r.content.sha, lastPush: Date.now(), lastError: null });
     return { ok: true };
   } catch (e) {

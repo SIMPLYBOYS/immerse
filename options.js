@@ -95,7 +95,7 @@ function wire() {
 
   document.getElementById("f").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const value = key.value.trim();
+    const value = clean(key.value);
     if (!value) return (msg.textContent = "enter a key first"); // don't wipe a saved key
     await chrome.storage.local.set({ apiKey: value });
     key.value = "";
@@ -112,11 +112,15 @@ function wire() {
     if (r.ghRepo) ghRepo.value = r.ghRepo;
     if (r.ghToken) ghToken.placeholder = `saved (…${r.ghToken.slice(-4)}) — type a new one to replace`;
   });
+  // Whitespace anywhere, not just at the ends: a credential copied out of a wrapped line carries
+  // a newline in its middle, which trim() leaves in place and the HTTP layer later rejects with
+  // "Unexpected char 0x0d in authorization value" — a failure that reads like a bad token.
+  const clean = (x) => String(x ?? "").replace(/\s+/g, "");
   document.getElementById("gh").addEventListener("submit", async (e) => {
     e.preventDefault();
     const patch = {};
-    if (ghRepo.value.trim()) patch.ghRepo = ghRepo.value.trim();
-    if (ghToken.value.trim()) patch.ghToken = ghToken.value.trim(); // empty must not wipe a saved token
+    if (clean(ghRepo.value)) patch.ghRepo = clean(ghRepo.value);
+    if (clean(ghToken.value)) patch.ghToken = clean(ghToken.value); // empty must not wipe a saved token
     if (!Object.keys(patch).length) return (ghMsg.textContent = "先填 repo 或 token");
     await chrome.storage.local.set(patch);
     if (patch.ghToken) {
