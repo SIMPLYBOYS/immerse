@@ -29,6 +29,7 @@ const { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos,
   require("./analytics.js");
 const { searchWords, filterWords, dueLabel, groupWords } = require("./library.js");
 const { foldSnapshots, pruneDeleted } = require("./merge.js");
+const { b64 } = require("./app/src/cloud.js");
 
 // --- SM-2 ---
 const T0 = 1_700_000_000_000;
@@ -355,6 +356,21 @@ assert.equal(merged.marks.gone, undefined);
 // An unreadable device file is skipped rather than sinking the whole restore.
 assert.equal(foldSnapshots([null, ext, "garbage"]).words.length, 3);
 assert.deepEqual(foldSnapshots([]).words, []);
+
+// --- the app's base64: GitHub wants it, the deck is full of Chinese, and React Native ships
+// neither btoa nor TextEncoder dependably. Node's Buffer is the reference.
+for (const sample of [
+  "",
+  "a",
+  "ab",
+  "abc", // every padding case
+  "整體性的、全面的", // 3-byte UTF-8 throughout
+  "breaking down｜分解", // mixed widths
+  "🎧 immerse", // surrogate pair: one code point, two UTF-16 units
+  JSON.stringify({ words: [{ word: "holistic", zh: "整體的" }] }), // a real snapshot shape
+]) {
+  assert.equal(b64(sample), Buffer.from(sample, "utf8").toString("base64"), `b64: ${sample}`);
+}
 
 // Tombstones expire, or the file grows forever.
 assert.deepEqual(pruneDeleted({ old: T0 - 100 * DAY, recent: T0 - DAY }, T0), { recent: T0 - DAY });

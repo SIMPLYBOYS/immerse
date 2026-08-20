@@ -213,4 +213,4 @@ function wireStats() {
 
 if (typeof document !== "undefined") wireStats();
 if (typeof module !== "undefined")
-  module.exports = { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches };
+  module.exports = { HEAT, heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches };
