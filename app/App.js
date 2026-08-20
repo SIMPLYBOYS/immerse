@@ -16,11 +16,16 @@ import Stats from "./src/screens/Stats";
 import Settings from "./src/screens/Settings";
 
 const RELEARN_GAP = 4; // a missed card comes back a few cards later, as on the desktop
+const MAX_HOLD = 5 * 60 * 1000; // the longest anything may sit unpushed
 
 export default function App() {
   const [cfg, setCfg] = useState(null);
   const [deck, setDeck] = useState(null); // the folded deck: every device's files merged
   const [ownLog, setOwnLog] = useState({}); // THIS device's review counts, never the folded total
+  // ...and its own immersion. Counters are SUMMED when folding, so pushing back the merged total
+  // would double every other device's minutes on the next pull, and double them again after that.
+  const [ownImm, setOwnImm] = useState({ immersion: 0, immLog: {}, immByVideo: {} });
+  const pulledImm = useRef({}); // our contribution as it stood at the last pull, for honest display
   const [ownSha, setOwnSha] = useState(null);
   const [busy, setBusy] = useState(true);
   const [err, setErr] = useState(null);
@@ -31,8 +36,14 @@ export default function App() {
   // The AppState listener fires outside the render cycle, where captured state would be whatever
   // it was when the effect ran. A ref carries the current values to it.
   const live = useRef({});
-  live.current = { cfg, deck, ownLog, ownSha };
+  live.current = { cfg, deck, ownLog, ownImm, ownSha, session };
   const dirty = useRef(false);
+  const dirtySince = useRef(0); // when the OLDEST unpushed change happened, not the newest
+
+  const markDirty = () => {
+    if (!dirty.current) dirtySince.current = Date.now();
+    dirty.current = true;
+  };
 
   const sync = useCallback(async (c) => {
     if (!c?.repo || !c?.token) return setBusy(false);
@@ -42,6 +53,13 @@ export default function App() {
       const r = await pull(c.repo, c.token, c.deviceId);
       setDeck(r.deck);
       setOwnLog(r.own?.log ?? {});
+      const mine = {
+        immersion: r.own?.immersion ?? 0,
+        immLog: r.own?.immLog ?? {},
+        immByVideo: r.own?.immByVideo ?? {},
+      };
+      setOwnImm(mine);
+      pulledImm.current = mine.immLog;
       setOwnSha(r.ownSha);
     } catch (e) {
       setErr(String(e?.message ?? e));
@@ -60,35 +78,99 @@ export default function App() {
     });
   }, [sync]);
 
-  // One upload per session rather than one per card. The deck is the cloud's to keep, but a
-  // commit per grade would mean seventy commits and seventy full-file uploads for one commute,
-  // each needing signal — which is the one thing a commute does not have.
+  // One upload per session rather than one per card: a commit per grade would mean seventy
+  // commits and seventy full-file uploads for one commute, each needing signal — the one thing a
+  // commute does not have. The heartbeat below bounds how long that batching can hold data.
   const pushNow = useCallback(async () => {
-    const { cfg: c, deck: d, ownLog: log, ownSha: sha } = live.current;
+    const { cfg: c, deck: d, ownLog: log, ownImm: imm, ownSha: sha } = live.current;
     if (!dirty.current || !c?.repo || !c?.token || !d) return;
+    const since = dirtySince.current;
     dirty.current = false;
+    dirtySince.current = 0;
     try {
       // words and log only. `marks` is derived from the rows when folding, and the counters this
       // device does not produce must stay out of its file or the fold would count them twice.
-      const next = await push(c.repo, c.token, c.deviceId, { words: d.words, log }, sha);
+      const next = await push(c.repo, c.token, c.deviceId, { words: d.words, log, ...imm }, sha);
       setOwnSha(next);
     } catch (e) {
       dirty.current = true; // still pending: try again on the next chance rather than losing it
+      // Keep the original age. Restamping it here would push the retry another full hold period
+      // away, so a run of failures would quietly stretch the window it is meant to bound.
+      dirtySince.current = since || Date.now();
       setErr(String(e?.message ?? e));
     }
   }, []);
 
+  // Unpushed work must go up before anything comes down: a pull replaces the deck wholesale, and
+  // the fold only knows what has been uploaded. Push first, then pull, and never during a review —
+  // swapping the deck under an open card would change the answer being looked at.
+  const refresh = useCallback(async () => {
+    const c = live.current.cfg;
+    if (!c?.repo || !c?.token) return;
+    if (dirty.current) await pushNow();
+    await sync(c);
+  }, [pushNow, sync]);
+
   useEffect(() => {
-    const sub = AppState.addEventListener("change", (s) => s !== "active" && pushNow());
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s !== "active") return pushNow();
+      // Coming back is the moment the desktop's changes matter most, and the moment a stale
+      // screen is most likely to be believed.
+      if (!live.current.session) refresh();
+    });
     return () => sub.remove();
+  }, [pushNow, refresh]);
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (!live.current.session) refresh();
+    }, MAX_HOLD);
+    return () => clearInterval(iv);
+  }, [refresh]);
+
+  // A review session ends and uploads itself. Watching never ends: a reader can sit in the
+  // foreground for an hour, and every word marked in that hour would be waiting on a background
+  // switch that may never arrive politely — a crash, a force-stop and a low-memory kill all skip
+  // it. So nothing stays unpushed for longer than MAX_HOLD.
+  //
+  // Age, not quiet. A debounce would never fire while a video plays, because the immersion clock
+  // banks seconds every fifteen and would reset the timer forever; this asks how old the oldest
+  // unpushed change is, which keeps moving no matter how busy things are.
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (dirty.current && Date.now() - dirtySince.current >= MAX_HOLD) pushNow();
+    }, 30_000);
+    return () => clearInterval(iv);
   }, [pushNow]);
 
   const applyRow = (row) => {
     setDeck((d) => ({ ...d, words: d.words.map((w) => (w.id === row.id ? row : w)) }));
-    dirty.current = true;
+    markDirty();
   };
 
   const bumpLog = (now) => setOwnLog((l) => ({ ...l, [dayKey(now)]: (l[dayKey(now)] ?? 0) + 1 }));
+
+  // Seconds actually watched in this app, banked in fifteens by the immersion screen.
+  const addImmersion = (sec, videoId) => {
+    const d = dayKey(Date.now());
+    setOwnImm((o) => ({
+      immersion: (o.immersion ?? 0) + sec,
+      immLog: { ...o.immLog, [d]: (o.immLog[d] ?? 0) + sec },
+      immByVideo: videoId
+        ? { ...o.immByVideo, [videoId]: (o.immByVideo[videoId] ?? 0) + sec }
+        : o.immByVideo,
+    }));
+    markDirty();
+  };
+
+  // Today's immersion across every device. The folded total already contains our contribution as
+  // it was at the last pull, so that stale share is removed before the live one is added —
+  // otherwise the minutes watched this session would appear twice.
+  const todaySec = () => {
+    const d = dayKey(Date.now());
+    const folded = deck?.immLog?.[d] ?? 0;
+    return folded - (pulledImm.current?.[d] ?? 0) + (ownImm.immLog?.[d] ?? 0);
+  };
 
   // Promoting or demoting from the library. `knownAt` is dropped on a demotion rather than left
   // behind — a word demoted back to 學習中 is no longer mastered and must not linger in the
@@ -131,7 +213,7 @@ export default function App() {
         marks: { ...d.marks, [id]: how },
       };
     });
-    dirty.current = true;
+    markDirty();
   };
 
   const start = () => {
@@ -204,7 +286,16 @@ export default function App() {
       );
     }
     if (!deck) return <Loading error={err} onRetry={() => sync(cfg)} />;
-    if (tab === "immerse") return <Immerse cfg={cfg} marks={deck.marks} onMark={markWord} />;
+    if (tab === "immerse")
+      return (
+        <Immerse
+          cfg={cfg}
+          marks={deck.marks}
+          onMark={markWord}
+          onImmersion={addImmersion}
+          todaySec={todaySec()}
+        />
+      );
     if (tab === "library") return <Library deck={deck} onStatus={setStatus} />;
     if (tab === "stats") return <Stats deck={deck} />;
     if (session) {

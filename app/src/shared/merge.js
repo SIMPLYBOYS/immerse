@@ -44,6 +44,30 @@ function foldSnapshots(snaps) {
   return { words, marks, ...counters, immersion, deleted };
 }
 
+// Counter arithmetic, kept here beside the fold that makes it necessary.
+//
+// A device must push only the seconds and reviews IT produced. The fold sums, so a device that
+// wrote the merged total back into its own file would have every other device's contribution
+// counted twice on the next pull, four times on the one after — the error compounds rather than
+// settling. So a device keeps its own tallies, stores everyone else's separately, and adds the
+// two only when something is displayed.
+const sumCounts = (a = {}, b = {}) => {
+  const out = { ...a };
+  for (const [k, v] of Object.entries(b)) out[k] = (out[k] ?? 0) + (Number(v) || 0);
+  return out;
+};
+
+// folded − ours = everyone else's. Clamped at zero: a fold taken before our last push can leave
+// a key looking negative, which would then be subtracted from a later display.
+const diffCounts = (folded = {}, mine = {}) => {
+  const out = {};
+  for (const [k, v] of Object.entries(folded)) {
+    const n = (Number(v) || 0) - (Number(mine[k]) || 0);
+    if (n > 0) out[k] = n;
+  }
+  return out;
+};
+
 // Tombstones are only needed until every device has seen them. Keeping them forever would grow
 // the file without bound; keeping them too briefly resurrects deletions on a device that was
 // offline the whole time.
@@ -52,4 +76,5 @@ function foldSnapshots(snaps) {
 const pruneDeleted = (deleted = {}, now = Date.now(), days = 90) =>
   Object.fromEntries(Object.entries(deleted).filter(([, at]) => at > now - days * 86400000));
 
-if (typeof module !== "undefined") module.exports = { foldSnapshots, pruneDeleted };
+if (typeof module !== "undefined")
+  module.exports = { foldSnapshots, pruneDeleted, sumCounts, diffCounts };

@@ -35,7 +35,16 @@ function idOf(input) {
   return m ? m[1] : null;
 }
 
-function Immerse({ cfg, marks, onMark }) {
+const mmss = (t) =>
+  `${Math.floor((t ?? 0) / 60)}:${String(Math.floor((t ?? 0) % 60)).padStart(2, "0")}`;
+
+// Minutes, because seconds on a habit counter is noise. Hours once there are enough of them.
+const mins = (sec) => {
+  const m = Math.floor((sec ?? 0) / 60);
+  return m >= 60 ? `${Math.floor(m / 60)} 時 ${m % 60} 分` : `${m} 分`;
+};
+
+function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
   const [index, setIndex] = useState({});
   const [input, setInput] = useState("");
   const [err, setErr] = useState(null);
@@ -65,14 +74,28 @@ function Immerse({ cfg, marks, onMark }) {
     setLoading(false);
   };
 
-  if (tx) return <Watch tx={tx} cfg={cfg} marks={marks} onMark={onMark} onBack={() => setTx(null)} />;
+  if (tx)
+    return (
+      <Watch
+        tx={tx}
+        cfg={cfg}
+        marks={marks}
+        onMark={onMark}
+        onImmersion={onImmersion}
+        todaySec={todaySec}
+        onBack={() => setTx(null)}
+      />
+    );
 
   const items = Object.entries(index ?? {}).sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0));
 
   return (
     <View style={S.screen}>
       <View style={[S.pad, { paddingBottom: 4 }]}>
-        <Text style={S.h1}>沉浸</Text>
+        <View style={S.row}>
+          <Text style={S.h1}>沉浸</Text>
+          <Text style={[S.sub, { fontSize: 13 }]}>⏱ 今日 {mins(todaySec)}</Text>
+        </View>
         <View style={{ flexDirection: "row", gap: 8, marginTop: 10 }}>
           <TextInput
             style={[S.input, { flex: 1 }]}
@@ -128,7 +151,7 @@ function Immerse({ cfg, marks, onMark }) {
   );
 }
 
-function Watch({ tx, cfg, marks, onMark, onBack }) {
+function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
   const [playing, setPlaying] = useState(true);
   const [at, setAt] = useState(0); // seconds, polled from the player
   const [zhOn, setZhOn] = useState(false);
@@ -144,6 +167,34 @@ function Watch({ tx, cfg, marks, onMark, onBack }) {
   const cur = useMemo(
     () => tx.sentences.findIndex((s) => at >= s.start && at < s.end),
     [at, tx.sentences],
+  );
+
+  // Immersion is time the video actually ran. Banked every fifteen seconds rather than every
+  // second: each hand-off re-renders the whole transcript list, and a counter nobody is watching
+  // does not deserve that. `banked` only exists so the header can move before the hand-off.
+  const pending = useRef(0);
+  const [banked, setBanked] = useState(0);
+  useEffect(() => {
+    if (!playing) return;
+    const iv = setInterval(() => {
+      pending.current += 1;
+      setBanked((b) => b + 1);
+      if (pending.current >= 15) {
+        onImmersion?.(pending.current, tx.videoId);
+        pending.current = 0;
+        setBanked(0);
+      }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [playing, onImmersion, tx.videoId]);
+
+  // Leaving mid-count must not throw the seconds away.
+  useEffect(
+    () => () => {
+      if (pending.current > 0) onImmersion?.(pending.current, tx.videoId);
+      pending.current = 0;
+    },
+    [onImmersion, tx.videoId],
   );
 
   // Twice a second keeps the highlight honest without interrogating the player constantly.
@@ -176,12 +227,18 @@ function Watch({ tx, cfg, marks, onMark, onBack }) {
     setPlaying(true);
   };
 
-  const tap = (word, sentence, start) => {
+  // Explaining one word or a circled phrase. Kept as one function because both are the same
+  // request — a phrase is just a longer "word" — cached by word|sentence so re-tapping never
+  // bills twice.
+  const explainSel = (word, sentence, start) => {
     const key = `${word}|${sentence}`;
-    setSel({
-      word, sentence, done: false, senses: [], context: "",
-      videoId: tx.videoId, title: tx.title, t: start,
-    });
+    // Merge, never replace: the selection range lives in this same object, and rebuilding it from
+    // scratch here silently dropped the range — which is why the expand handles never appeared.
+    setSel((c) => ({
+      ...(c ?? {}),
+      word, sentence, videoId: tx.videoId, title: tx.title, t: start,
+      done: false, pending: false, senses: [], context: "", contextZh: "",
+    }));
     let job = cache.current.get(key);
     if (!job) {
       job = explain(cfg.apiKey, word, sentence)
@@ -197,6 +254,60 @@ function Watch({ tx, cfg, marks, onMark, onBack }) {
     );
   };
 
+  // Every sentence's tappable tokens, computed once. A phrase circled by the user is a range of
+  // these; the model's own phrases are already single tokens (splitPhrases boxed them).
+  const lineTokens = useMemo(
+    () => tx.sentences.map((s) => tokenize(s.text, tx.phrases ?? [])),
+    [tx],
+  );
+
+  // 圈選片語 on a phone: tap a word, then grow the selection outwards one word at a time with
+  // the ◀ ▶ handles. Dragging is not available here — that gesture belongs to the scrolling
+  // list — and hunting for a second endpoint by tapping was worse than either. Handles are
+  // precise on a small screen and cost nothing to undo.
+  //
+  // Expanding does NOT re-ask the model. Each press would otherwise be another paid call while
+  // the reader is still deciding where the phrase ends; the lookup waits for 查詢.
+  const wordsOf = (line, from, to) =>
+    lineTokens[line]
+      .filter((x) => x.t === "w" && x.idx >= from && x.idx <= to)
+      .map((x) => x.word)
+      .join(" ");
+
+  const lastIdx = (line) => {
+    const ws = lineTokens[line].filter((x) => x.t === "w");
+    return ws.length ? ws[ws.length - 1].idx : 0;
+  };
+
+  const onWordPress = (line, idx, word) => {
+    const s = tx.sentences[line];
+    setSel({ range: { line, from: idx, to: idx } }); // the range first, the explanation merges in
+    explainSel(word, s.text, s.start);
+  };
+
+  // side: "L" | "R", step: -1 shrinks, +1 grows
+  const expand = (side, step) => {
+    setSel((c) => {
+      if (!c?.range) return c;
+      const { line, from, to } = c.range;
+      const next =
+        side === "L"
+          ? { line, from: Math.max(0, Math.min(to, from - step)), to }
+          : { line, from, to: Math.max(from, Math.min(lastIdx(line), to + step)) };
+      if (next.from === from && next.to === to) return c;
+      const phrase = wordsOf(line, next.from, next.to);
+      // The explanation on screen belongs to the old selection, so it is cleared rather than
+      // left to be read as if it described the new one.
+      return { ...c, word: phrase, range: next, done: false, senses: [], context: "", contextZh: "", pending: true };
+    });
+  };
+
+  const lookup = () => {
+    if (!sel?.range) return;
+    const s = tx.sentences[sel.range.line];
+    explainSel(sel.word, s.text, s.start);
+  };
+
   return (
     <View style={S.screen}>
       <View style={[S.row, { paddingHorizontal: 16, paddingVertical: 8 }]}>
@@ -204,6 +315,7 @@ function Watch({ tx, cfg, marks, onMark, onBack }) {
           <Text style={[S.sub, { fontSize: 15 }]}>‹ 返回</Text>
         </Pressable>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+          <Text style={[S.sub, { fontSize: 12, marginRight: 8 }]}>⏱ {mins(todaySec + banked)}</Text>
           <Text style={[S.sub, { fontSize: 12 }]}>跟隨</Text>
           <Switch value={follow} onValueChange={setFollow} />
           <Text style={[S.sub, { fontSize: 12, marginLeft: 8 }]}>中文</Text>
@@ -225,7 +337,7 @@ function Watch({ tx, cfg, marks, onMark, onBack }) {
       />
       {perr && (
         <Text style={[S.sub, { paddingHorizontal: 16, color: C.amber, lineHeight: 18 }]}>
-          播放器錯誤 {perr} — 逐字稿仍可閱讀、點字與朗讀。
+          播放器錯誤 {perr} — 逐字稿仍可閱讀、點字查詢。
         </Text>
       )}
 
@@ -238,30 +350,43 @@ function Watch({ tx, cfg, marks, onMark, onBack }) {
         onScrollToIndexFailed={() => {}}
         renderItem={({ item, index }) => (
           <Line
-            s={item}
+            tokens={lineTokens[index]}
+            lineIndex={index}
+            time={item.start}
             on={index === cur}
             zh={zhOn ? tx.zh?.[index] : null}
-            phrases={tx.phrases ?? []}
             pos={tx.pos ?? {}}
             marks={marks}
-            onWord={(w, sent) => tap(w, sent, item.start)}
+            range={sel?.range && sel.range.line === index ? sel.range : null}
+            onWordPress={onWordPress}
             onSeek={() => seek(item.start)}
           />
         )}
       />
 
-      {sel && <Sheet item={sel} marks={marks} onMark={onMark} onClose={() => setSel(null)} />}
+      {sel && (
+        <Sheet
+          item={sel}
+          marks={marks}
+          onMark={onMark}
+          onExpand={expand}
+          onLookup={lookup}
+          onClose={() => setSel(null)}
+        />
+      )}
     </View>
   );
 }
 
-function Line({ s, on, zh, phrases, pos, marks, onWord, onSeek }) {
-  // splitPhrases marks the stretches that are known expressions, so a phrasal verb stays one
-  // tappable unit instead of two words that each mean something else.
-  const runs = useMemo(() => splitPhrases(s.text, phrases), [s.text, phrases]);
+function Line({ tokens, lineIndex, time, on, zh, pos, marks, range, onWordPress, onSeek }) {
   return (
-    <View
+    // Tapping anywhere that is not a word seeks the player to this line. The words keep their own
+    // taps, so the gesture only lands here in the gaps — which is exactly where a reader aiming
+    // at "this bit" would press anyway.
+    <Pressable
+      onPress={onSeek}
       style={{
+        flexDirection: "row",
         marginBottom: 10,
         padding: 10,
         borderRadius: 10,
@@ -270,45 +395,44 @@ function Line({ s, on, zh, phrases, pos, marks, onWord, onSeek }) {
         borderLeftColor: on ? C.blue : "transparent",
       }}
     >
+      {/* The moment this line is spoken, so a place in the video can be found by eye. */}
+      <Text style={{ width: 42, fontSize: 11, color: on ? C.blue : C.dim, paddingTop: 7 }}>
+        {mmss(time)}
+      </Text>
+      <View style={{ flex: 1 }}>
       <Text style={{ fontSize: 17, lineHeight: 30, color: C.text }}>
-        {runs.map((run, i) =>
-          run.phrase ? (
-            <Word key={i} display={run.text} word={run.text} isPhrase {...{ pos, marks, onWord, sentence: s.text }} />
+        {tokens.map((tk, i) =>
+          tk.t === "txt" ? (
+            <Text key={i}>{tk.display}</Text>
           ) : (
-            run.text.split(/(\s+)/).map((tok, j) => {
-              const w = tok.match(WORD);
-              return w ? (
-                <Word key={`${i}-${j}`} display={tok} word={w[0]} {...{ pos, marks, onWord, sentence: s.text }} />
-              ) : (
-                <Text key={`${i}-${j}`}>{tok}</Text>
-              );
-            })
+            <Word
+              key={i}
+              display={tk.display}
+              word={tk.word}
+              isPhrase={tk.isPhrase}
+              pos={pos}
+              how={marks?.[tk.word.toLowerCase()]}
+              picked={!!range && tk.idx >= range.from && tk.idx <= range.to}
+              onPress={() => onWordPress(lineIndex, tk.idx, tk.word)}
+            />
           ),
         )}
       </Text>
       {zh ? <Text style={[S.sub, { marginTop: 4, fontSize: 14 }]}>{zh}</Text> : null}
-      <View style={{ flexDirection: "row", gap: 16, marginTop: 6 }}>
-        <Pressable onPress={onSeek} hitSlop={8}>
-          <Text style={{ fontSize: 12, color: C.blue }}>▶ 從這句播</Text>
-        </Pressable>
-        <Pressable onPress={() => Speech.speak(s.text, { language: "en-US" })} hitSlop={8}>
-          <Text style={[S.sub, { fontSize: 12 }]}>🔊 朗讀</Text>
-        </Pressable>
       </View>
-    </View>
+    </Pressable>
   );
 }
 
-function Word({ display, word, isPhrase, pos, marks, onWord, sentence }) {
-  const how = marks?.[word.toLowerCase()];
+function Word({ display, word, isPhrase, pos, how, picked, onPress }) {
   const p = posOf(word, pos);
   return (
     <Text
-      onPress={() => onWord(word, sentence)}
+      onPress={onPress}
       suppressHighlighting
       style={{
         color: p ? POS[p] ?? C.text : C.text,
-        ...(isPhrase ? { backgroundColor: "#fff6d6" } : null),
+        ...(picked ? { backgroundColor: "#fc0", color: "#000" } : isPhrase ? { backgroundColor: "#fff6d6" } : null),
         ...(how
           ? { textDecorationLine: "underline", textDecorationColor: how === "known" ? C.green : C.blue }
           : null),
@@ -319,9 +443,48 @@ function Word({ display, word, isPhrase, pos, marks, onWord, sentence }) {
   );
 }
 
+// Flattens a sentence into render tokens: whitespace/punctuation as plain text, each tappable
+// word (or model phrase) numbered so a circled range can be rebuilt from two endpoints.
+function tokenize(text, phrases) {
+  const out = [];
+  let idx = 0;
+  for (const run of splitPhrases(text, phrases)) {
+    if (run.phrase) {
+      out.push({ t: "w", word: run.text, display: run.text, isPhrase: true, idx: idx++ });
+      continue;
+    }
+    for (const tok of run.text.split(/(\s+)/)) {
+      if (!tok) continue;
+      const w = tok.match(WORD);
+      if (w) out.push({ t: "w", word: w[0], display: tok, isPhrase: false, idx: idx++ });
+      else out.push({ t: "txt", display: tok });
+    }
+  }
+  return out;
+}
+
+function Handle({ label, onPress, dim }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      hitSlop={8}
+      style={{
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: C.line,
+        backgroundColor: dim ? "transparent" : "#fff6d6",
+      }}
+    >
+      <Text style={{ fontSize: 13, color: dim ? C.dim : C.text }}>{label}</Text>
+    </Pressable>
+  );
+}
+
 // The explanation, and the only place a word enters the deck. Tapping a word is curiosity;
 // pressing 學習中 is the commitment — the same rule the extension follows.
-function Sheet({ item, marks, onMark, onClose }) {
+function Sheet({ item, marks, onMark, onExpand, onLookup, onClose }) {
   const how = marks?.[item.word.toLowerCase()];
   return (
     <View
@@ -348,8 +511,30 @@ function Sheet({ item, marks, onMark, onClose }) {
         </Pressable>
       </View>
 
+      {/* Grow or shrink the selection a word at a time from either end. The matching words light
+          up in the transcript above, so the range is visible where it actually lives rather than
+          only as text in here. */}
+      {item.range && (
+        <View style={[S.row, { marginTop: 10 }]}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <Text style={[S.sub, { fontSize: 11 }]}>左</Text>
+            <Handle label="◀" onPress={() => onExpand("L", 1)} />
+            <Handle label="▶" onPress={() => onExpand("L", -1)} dim />
+          </View>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <Handle label="◀" onPress={() => onExpand("R", -1)} dim />
+            <Handle label="▶" onPress={() => onExpand("R", 1)} />
+            <Text style={[S.sub, { fontSize: 11 }]}>右</Text>
+          </View>
+        </View>
+      )}
+
       <ScrollView style={{ marginTop: 10 }}>
-        {!item.done ? (
+        {item.pending ? (
+          <Pressable style={[S.btn, S.primary, { marginVertical: 12 }]} onPress={onLookup}>
+            <Text style={[S.btnText, S.primaryText]}>查詢「{item.word}」</Text>
+          </Pressable>
+        ) : !item.done ? (
           <ActivityIndicator color={C.dim} style={{ marginVertical: 20 }} />
         ) : (
           <>
@@ -381,7 +566,8 @@ function Sheet({ item, marks, onMark, onClose }) {
         ].map(([k, label]) => (
           <Pressable
             key={k}
-            style={[S.btn, { flex: 1, paddingVertical: 10 }, how === k && S.primary]}
+            style={[S.btn, { flex: 1, paddingVertical: 10 }, how === k && S.primary, item.pending && { opacity: 0.4 }]}
+            disabled={item.pending} // an unlooked-up phrase would enter the deck as an empty card
             onPress={() => onMark(item, k)}
           >
             <Text style={[S.btnText, { fontSize: 14 }, how === k && S.primaryText]}>{label}</Text>
