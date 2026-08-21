@@ -9,12 +9,17 @@ const {
   ScrollView,
   ActivityIndicator,
   Switch,
+  Linking,
+  Alert,
+  useWindowDimensions,
+  PanResponder,
 } = require("react-native");
 const YoutubePlayer = require("react-native-youtube-iframe").default;
 const Speech = require("expo-speech");
 const { C, S, POS } = require("../theme");
-const { splitPhrases, posOf, parseReply, WORD } = require("../logic");
+const { splitPhrases, posOf, parseReply, spokenIdx, WORD } = require("../logic");
 const { listTx, getTx } = require("../cloud");
+const { loadHidden, hideVideo, loadSplit, saveSplit } = require("../store");
 const { explain } = require("../ai");
 
 // Watching, not just reading. The video plays, the line being spoken lights up and scrolls
@@ -38,7 +43,20 @@ function idOf(input) {
 const mmss = (t) =>
   `${Math.floor((t ?? 0) / 60)}:${String(Math.floor((t ?? 0) % 60)).padStart(2, "0")}`;
 
-// Minutes, because seconds on a habit counter is noise. Hours once there are enough of them.
+// The player's own error codes. The first two are the uploader's decision — embedding is switched
+// off for that video, so it will not play inside ANY app, ours or anyone else's — and the rest
+// are the video or the device being unavailable. All of them mean the same thing here: no video,
+// so the transcript carries the session alone and the video opens in YouTube instead.
+const PLAYER_ERR = {
+  embed_not_allowed: "這支影片的擁有者關閉了嵌入播放",
+  not_embeddable: "這支影片的擁有者關閉了嵌入播放",
+  video_not_found: "找不到這支影片（可能已刪除或設為私人）",
+  html5_error: "這台裝置無法播放這支影片",
+};
+
+// Minutes for the day's total on the picker, where the number is a record and seconds would be
+// noise. The counter inside a session uses mmss instead: there it is feedback for something
+// happening right now, and one that sits still for a whole minute reads as a broken clock.
 const mins = (sec) => {
   const m = Math.floor((sec ?? 0) / 60);
   return m >= 60 ? `${Math.floor(m / 60)} 時 ${m % 60} 分` : `${m} 分`;
@@ -50,6 +68,30 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
   const [err, setErr] = useState(null);
   const [tx, setTx] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [hidden, setHidden] = useState(null); // null until the phone has been read
+
+  useEffect(() => {
+    loadHidden().then(setHidden);
+  }, []);
+
+  // Struck off this phone's list, not deleted from the repo — so it can always be opened again by
+  // pasting the id above, which is why there is no separate undo.
+  const hide = (id, title) =>
+    Alert.alert("移除這支影片？", `${title}\n\n只從這支手機的清單移除，逐字稿還在雲端。之後貼上網址或影片 ID 就能再開。`, [
+      { text: "取消", style: "cancel" },
+      {
+        text: "移除",
+        style: "destructive",
+        // The card only leaves the screen once the phone has actually recorded it. Hiding first
+        // and writing afterwards would show a removal that silently undoes itself on next launch.
+        onPress: () =>
+          hideVideo(id)
+            .then(setHidden)
+            .catch((e) =>
+              Alert.alert("沒有移除成功", `這支手機存不起來，所以卡片留著。\n\n${e?.message ?? e}`),
+            ),
+      },
+    ]);
 
   const refresh = useCallback(() => {
     if (!cfg?.repo || !cfg?.token) return;
@@ -87,7 +129,11 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
       />
     );
 
-  const items = Object.entries(index ?? {}).sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0));
+  const gone = new Set(hidden ?? []);
+  const all = Object.entries(index ?? {});
+  const items = all
+    .filter(([id]) => !gone.has(id))
+    .sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0));
 
   return (
     <View style={S.screen}>
@@ -129,21 +175,34 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
           items.length ? <Text style={[S.sub, { marginBottom: 8 }]}>桌機看過的影片</Text> : null
         }
         ListEmptyComponent={
-          !loading ? (
+          loading ? null : all.length ? (
+            // Everything there is has been struck off — saying "there are no transcripts" here
+            // would be a lie, and would hide the way back.
+            <Text style={[S.sub, { lineHeight: 20 }]}>
+              清單上的 {all.length} 支都移除了。貼上網址或影片 ID 就能再開啟。
+            </Text>
+          ) : (
             <Text style={[S.sub, { lineHeight: 20 }]}>
               還沒有逐字稿。在桌機上開一支有字幕的影片，擴充會自動把它存進雲端。
             </Text>
-          ) : null
+          )
         }
         renderItem={({ item: [id, meta] }) => (
-          <Pressable style={[S.card, { marginBottom: 8 }]} onPress={() => open(id)}>
-            <Text style={{ fontSize: 15, fontWeight: "600", color: C.text }} numberOfLines={2}>
-              {meta.title || id}
-            </Text>
-            <Text style={[S.sub, { marginTop: 4 }]}>
-              {meta.n ? `${meta.n} 句 · ` : ""}
-              {meta.at ? new Date(meta.at).toLocaleDateString() : id}
-            </Text>
+          <Pressable style={[S.card, S.row, { marginBottom: 8 }]} onPress={() => open(id)}>
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontSize: 15, fontWeight: "600", color: C.text }} numberOfLines={2}>
+                {meta.title || id}
+              </Text>
+              <Text style={[S.sub, { marginTop: 4 }]}>
+                {meta.n ? `${meta.n} 句 · ` : ""}
+                {meta.at ? new Date(meta.at).toLocaleDateString() : id}
+              </Text>
+            </View>
+            {/* Its own press target, and a generous one: a mis-tap here costs the card, and the
+                card sitting under it opens a video. */}
+            <Pressable onPress={() => hide(id, meta.title || id)} hitSlop={14} style={{ paddingLeft: 12 }}>
+              <Text style={{ fontSize: 17, color: C.dim }}>✕</Text>
+            </Pressable>
           </Pressable>
         )}
       />
@@ -151,23 +210,71 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
   );
 }
 
+// Far enough either way to be worth dragging, never so far that the other column disappears.
+const SPLIT = 0.6;
+const clampSplit = (r) => Math.min(0.78, Math.max(0.3, r));
+
 function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
-  const [playing, setPlaying] = useState(true);
-  const [at, setAt] = useState(0); // seconds, polled from the player
+  // What the player was asked to do and what it is actually doing are two different facts, and
+  // one flag standing for both is what let the immersion clock bank seconds for a video nobody
+  // was watching: mobile browsers routinely refuse autoplay, and when they do the video sits
+  // still and no state event ever arrives to correct the assumption.
+  const [want, setWant] = useState(true); // the request — autoplay on open
+  const [playing, setPlaying] = useState(false); // the report — everything timed keys off this
+  const [cur, setCur] = useState(-1); // the line being spoken, NOT the raw clock
   const [zhOn, setZhOn] = useState(false);
   const [follow, setFollow] = useState(true);
   const [sel, setSel] = useState(null);
   const [perr, setPerr] = useState(null);
   const player = useRef(null);
   const list = useRef(null);
+
+  // Turned sideways the screen is short and wide, so stacking the player above the transcript
+  // would leave a couple of lines visible under it. Side by side, the video gets a column and the
+  // reading gets the rest — and the video is sized from that column rather than pinned at 200,
+  // which is also what makes it bigger in portrait than the fixed height was.
+  const { width, height } = useWindowDimensions();
+  const land = width > height;
+
+  // Where the divider sits, as a fraction of the width. Half the screen made the video no bigger
+  // than it is in portrait, which defeats the point of turning the phone over; 0.6 fills the
+  // height a typical handset has sideways. It is draggable because the trade-off — a bigger
+  // picture against more lines of transcript — is not one answer for everybody.
+  const [ratio, setRatio] = useState(SPLIT);
+  const ratioRef = useRef(SPLIT);
+  const grabbed = useRef(SPLIT);
+  const widthRef = useRef(width);
+  ratioRef.current = ratio;
+  widthRef.current = width;
+
+  useEffect(() => {
+    loadSplit(SPLIT).then((r) => setRatio(clampSplit(r)));
+  }, []);
+
+  const drag = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => (grabbed.current = ratioRef.current),
+      onPanResponderMove: (_, g) => {
+        const next = clampSplit(grabbed.current + g.dx / (widthRef.current || 1));
+        // Both columns re-lay-out on every accepted move, so ignore the sub-pixel ones.
+        if (Math.abs(next - ratioRef.current) > 0.005) setRatio(next);
+      },
+      // Only on release: a write per frame would be hundreds of them for one drag.
+      onPanResponderRelease: () => saveSplit(ratioRef.current).catch(() => {}),
+    }),
+  ).current;
+
+  const colW = land ? Math.round(width * ratio) : width;
+  // Dragged far enough, 16:9 of the column would be taller than the screen. Give back width
+  // instead of height: a player told to be wide and short letterboxes itself, and the reader
+  // ends up with black bars where the picture was supposed to get bigger.
+  const playerW = Math.min(colW, Math.round((height * 0.78 * 16) / 9));
+  const playerH = Math.round((playerW * 9) / 16);
   const cache = useRef(new Map()); // word|sentence → promise, so re-tapping never bills twice
 
-  // Which line is being spoken. Every sentence carries a start and an end, so this is a lookup
-  // rather than a guess — the same one the desktop uses for A/S/D.
-  const cur = useMemo(
-    () => tx.sentences.findIndex((s) => at >= s.start && at < s.end),
-    [at, tx.sentences],
-  );
+
 
   // Immersion is time the video actually ran. Banked every fifteen seconds rather than every
   // second: each hand-off re-renders the whole transcript list, and a counter nobody is watching
@@ -203,13 +310,20 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
     const iv = setInterval(async () => {
       try {
         const t = await player.current?.getCurrentTime();
-        if (typeof t === "number") setAt(t);
+        if (typeof t !== "number") return;
+        // Which line is being spoken — a lookup, not a guess, because every sentence carries a
+        // start and an end. Storing the raw clock instead re-rendered the entire transcript twice
+        // a second; with the Chinese lines switched on there was enough work in each pass for the
+        // list to visibly jitter. The index only changes once a line, so the list only redraws
+        // once a line.
+        const i = tx.sentences.findIndex((s) => t >= s.start && t < s.end);
+        setCur((c) => (c === i ? c : i));
       } catch {
         // not ready yet, or gone — the next tick will do
       }
     }, 500);
     return () => clearInterval(iv);
-  }, [playing]);
+  }, [playing, tx.sentences]);
 
   // Keep the spoken line on screen, unless the reader has taken the wheel by scrolling.
   useEffect(() => {
@@ -221,10 +335,16 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
     }
   }, [cur, follow]);
 
+  const openInYouTube = (sec = 0) =>
+    Linking.openURL(`https://youtu.be/${tx.videoId}?t=${Math.floor(Math.max(0, sec))}`);
+
   const seek = (sec) => {
+    // No embedded player: the gesture still means "play from here", it just has to happen in the
+    // YouTube app. Seeking a player that never loaded would be a tap that does nothing.
+    if (perr) return openInYouTube(sec);
     player.current?.seekTo(Math.max(0, sec), true);
-    setAt(sec);
-    setPlaying(true);
+    setCur(tx.sentences.findIndex((s) => sec >= s.start && sec < s.end));
+    setWant(true); // ask; the clock starts when the player says it started
   };
 
   // Explaining one word or a circled phrase. Kept as one function because both are the same
@@ -315,7 +435,16 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
           <Text style={[S.sub, { fontSize: 15 }]}>‹ 返回</Text>
         </Pressable>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-          <Text style={[S.sub, { fontSize: 12, marginRight: 8 }]}>⏱ {mins(todaySec + banked)}</Text>
+          {/* The dot says whether the clock beside it is running. Labelled too, because bare
+              m:ss beside a transcript full of m:ss timestamps would read as the playback
+              position rather than as time immersed. */}
+          <View
+            style={{
+              width: 8, height: 8, borderRadius: 4, marginRight: 2,
+              backgroundColor: playing ? "#e5484d" : C.dim,
+            }}
+          />
+          <Text style={[S.sub, { fontSize: 12, marginRight: 8 }]}>今日 {mmss(todaySec + banked)}</Text>
           <Text style={[S.sub, { fontSize: 12 }]}>跟隨</Text>
           <Switch value={follow} onValueChange={setFollow} />
           <Text style={[S.sub, { fontSize: 12, marginLeft: 8 }]}>中文</Text>
@@ -323,46 +452,91 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
         </View>
       </View>
 
-      <YoutubePlayer
-        ref={player}
-        height={200}
-        play={playing}
-        videoId={tx.videoId}
-        initialPlayerParams={{ modestbranding: true, rel: false }}
-        onChangeState={(s) => {
-          if (s === "playing") setPlaying(true);
-          if (s === "paused" || s === "ended") setPlaying(false);
-        }}
-        onError={(e) => setPerr(String(e))}
-      />
-      {perr && (
-        <Text style={[S.sub, { paddingHorizontal: 16, color: C.amber, lineHeight: 18 }]}>
-          播放器錯誤 {perr} — 逐字稿仍可閱讀、點字查詢。
-        </Text>
-      )}
+      <View style={{ flex: 1, flexDirection: land ? "row" : "column" }}>
+        <View style={land ? { width: colW } : null}>
+          <View style={{ alignItems: "center" }}>
+            <YoutubePlayer
+              ref={player}
+              height={playerH}
+              width={playerW}
+              play={want}
+              videoId={tx.videoId}
+              initialPlayerParams={{ modestbranding: true, rel: false }}
+              onChangeState={(s) => {
+                // Keep the request in step with reality — started from the player's own button,
+                // the request must agree, or a later render could hand it a stale play={false}.
+                if (s === "playing") {
+                  setPlaying(true);
+                  setWant(true);
+                }
+                // Paused from the player's own controls: stop asking, or the next render would
+                // hand it play={true} again and fight the person who just pressed pause.
+                if (s === "paused" || s === "ended") {
+                  setPlaying(false);
+                  setWant(false);
+                }
+              }}
+              onError={(e) => {
+                setPerr(String(e));
+                setPlaying(false); // nothing is playing, so the immersion clock must not keep counting
+                setWant(false);
+              }}
+            />
+          </View>
+          {perr && (
+            <View style={{ paddingHorizontal: 16, paddingTop: 8 }}>
+              <Text style={{ color: C.amber, fontSize: 13, lineHeight: 19 }}>
+                {PLAYER_ERR[perr] ?? `播放器錯誤：${perr}`}
+              </Text>
+              <Text style={[S.sub, { marginTop: 4, lineHeight: 18 }]}>
+                逐字稿仍可閱讀、點字查詢、標生字。點任一行會用 YouTube 開啟那一刻。
+              </Text>
+              <Pressable style={[S.btn, { marginTop: 10, paddingVertical: 8 }]} onPress={() => openInYouTube(0)}>
+                <Text style={S.btnText}>在 YouTube 開啟</Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
 
-      <FlatList
-        ref={list}
-        data={tx.sentences}
-        keyExtractor={(_, i) => String(i)}
-        contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
-        onScrollBeginDrag={() => setFollow(false)} // taking the wheel turns off autopilot
-        onScrollToIndexFailed={() => {}}
-        renderItem={({ item, index }) => (
-          <Line
-            tokens={lineTokens[index]}
-            lineIndex={index}
-            time={item.start}
-            on={index === cur}
-            zh={zhOn ? tx.zh?.[index] : null}
-            pos={tx.pos ?? {}}
-            marks={marks}
-            range={sel?.range && sel.range.line === index ? sel.range : null}
-            onWordPress={onWordPress}
-            onSeek={() => seek(item.start)}
-          />
+        {land && (
+          // Wider than it looks: the grip is 8pt of line in a 22pt target, because a divider that
+          // has to be hit exactly is a divider nobody moves.
+          <View
+            {...drag.panHandlers}
+            style={{ width: 22, alignItems: "center", justifyContent: "center" }}
+          >
+            <View style={{ width: 4, height: 44, borderRadius: 2, backgroundColor: C.line }} />
+          </View>
         )}
-      />
+
+        <View style={{ flex: 1 }}>
+          <FlatList
+            ref={list}
+            data={tx.sentences}
+            keyExtractor={(_, i) => String(i)}
+            contentContainerStyle={{ padding: 16, paddingBottom: zhOn ? 120 : 40 }}
+            onScrollBeginDrag={() => setFollow(false)} // taking the wheel turns off autopilot
+            onScrollToIndexFailed={() => {}}
+            renderItem={({ item, index }) => (
+              <Line
+                tokens={lineTokens[index]}
+                lineIndex={index}
+                sentence={item}
+                on={index === cur}
+                player={player}
+                playing={playing}
+                pos={tx.pos ?? {}}
+                marks={marks}
+                range={sel?.range && sel.range.line === index ? sel.range : null}
+                onWordPress={onWordPress}
+                onSeek={() => seek(item.start)}
+              />
+            )}
+          />
+
+          {zhOn && !perr && <ZhBar cues={tx.zhCues ?? []} player={player} playing={playing} />}
+        </View>
+      </View>
 
       {sel && (
         <Sheet
@@ -378,7 +552,80 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
   );
 }
 
-function Line({ tokens, lineIndex, time, on, zh, pos, marks, range, onWordPress, onSeek }) {
+// The translated line for the moment being played.
+//
+// Not "the translation of this sentence" — that pairing was tried three times and is not
+// obtainable from this data: a translated cue straddles English sentence boundaries, its length
+// is not proportional to the English it replaces, and the track runs behind the English one, so
+// every split was a guess that showed up as blank lines and mismatched text. Asked against the
+// clock instead, there is nothing to guess: whatever cue is playing IS the translation of what
+// is being said.
+//
+// It polls the player itself and keeps its own state so that a new cue redraws this one line and
+// not the whole transcript — holding the clock in the screen above is what made the list jitter.
+function ZhBar({ cues, player, playing }) {
+  const [i, setI] = useState(-1);
+
+  useEffect(() => {
+    if (!playing || !cues.length) return;
+    const iv = setInterval(async () => {
+      try {
+        const t = await player.current?.getCurrentTime();
+        if (typeof t !== "number") return;
+        const n = cues.findIndex((c) => t >= c.start && t < c.end);
+        setI((c) => (c === n ? c : n));
+      } catch {
+        // not ready yet, or gone — the next tick will do
+      }
+    }, 500);
+    return () => clearInterval(iv);
+  }, [playing, cues, player]);
+
+  return (
+    // Floated over the transcript rather than stacked above it. A cue is 13 characters at the
+    // median but 5% run past three lines, and a bar in the layout would shove the whole list up
+    // and down as it resized — the jitter this screen just got rid of. Over the top it can be as
+    // tall as the line needs without moving anything, and nothing gets cut off.
+    <View
+      style={{
+        position: "absolute", left: 0, right: 0, bottom: 0,
+        paddingHorizontal: 16, paddingVertical: 10,
+        backgroundColor: "rgba(255,255,255,0.96)", borderTopWidth: 1, borderTopColor: "#e5e7eb",
+      }}
+      pointerEvents="none"
+    >
+      <Text style={{ fontSize: 15, lineHeight: 22, color: cues.length ? C.text : C.dim }}>
+        {cues.length ? cues[i]?.text ?? "" : "這份逐字稿沒有中文軌（舊版）。在桌機重開一次這支影片就會補上。"}
+      </Text>
+    </View>
+  );
+}
+
+function Line({ tokens, lineIndex, sentence, on, player, playing, pos, marks, range, onWordPress, onSeek }) {
+  const [spoken, setSpoken] = useState(-1);
+
+  // Only the line being spoken keeps a clock, and it holds the result itself — so a word lighting
+  // up four times a second redraws this one row instead of the whole transcript. That is the same
+  // reason the screen above tracks a line index rather than the raw seconds.
+  useEffect(() => {
+    if (!on) {
+      setSpoken(-1);
+      return;
+    }
+    if (!playing) return; // paused: leave the last word lit, so the eye keeps its place
+    const iv = setInterval(async () => {
+      try {
+        const t = await player.current?.getCurrentTime();
+        if (typeof t !== "number") return;
+        const n = spokenIdx(tokens, sentence, t);
+        setSpoken((c) => (c === n ? c : n));
+      } catch {
+        // not ready yet, or gone — the next tick will do
+      }
+    }, 250);
+    return () => clearInterval(iv);
+  }, [on, playing, tokens, sentence, player]);
+
   return (
     // Tapping anywhere that is not a word seeks the player to this line. The words keep their own
     // taps, so the gesture only lands here in the gaps — which is exactly where a reader aiming
@@ -397,7 +644,7 @@ function Line({ tokens, lineIndex, time, on, zh, pos, marks, range, onWordPress,
     >
       {/* The moment this line is spoken, so a place in the video can be found by eye. */}
       <Text style={{ width: 42, fontSize: 11, color: on ? C.blue : C.dim, paddingTop: 7 }}>
-        {mmss(time)}
+        {mmss(sentence.start)}
       </Text>
       <View style={{ flex: 1 }}>
       <Text style={{ fontSize: 17, lineHeight: 30, color: C.text }}>
@@ -413,18 +660,18 @@ function Line({ tokens, lineIndex, time, on, zh, pos, marks, range, onWordPress,
               pos={pos}
               how={marks?.[tk.word.toLowerCase()]}
               picked={!!range && tk.idx >= range.from && tk.idx <= range.to}
+              spoken={tk.idx === spoken}
               onPress={() => onWordPress(lineIndex, tk.idx, tk.word)}
             />
           ),
         )}
       </Text>
-      {zh ? <Text style={[S.sub, { marginTop: 4, fontSize: 14 }]}>{zh}</Text> : null}
       </View>
     </Pressable>
   );
 }
 
-function Word({ display, word, isPhrase, pos, how, picked, onPress }) {
+function Word({ display, word, isPhrase, pos, how, picked, spoken, onPress }) {
   const p = posOf(word, pos);
   return (
     <Text
@@ -432,7 +679,13 @@ function Word({ display, word, isPhrase, pos, how, picked, onPress }) {
       suppressHighlighting
       style={{
         color: p ? POS[p] ?? C.text : C.text,
-        ...(picked ? { backgroundColor: "#fc0", color: "#000" } : isPhrase ? { backgroundColor: "#fff6d6" } : null),
+        ...(picked
+          ? { backgroundColor: "#fc0", color: "#000" }
+          : spoken
+            ? { backgroundColor: "#dbeafe", fontWeight: "700" }
+            : isPhrase
+              ? { backgroundColor: "#fff6d6" }
+              : null),
         ...(how
           ? { textDecorationLine: "underline", textDecorationColor: how === "known" ? C.green : C.blue }
           : null),
@@ -448,16 +701,19 @@ function Word({ display, word, isPhrase, pos, how, picked, onPress }) {
 function tokenize(text, phrases) {
   const out = [];
   let idx = 0;
+  let at = 0; // character offset into the sentence — what turns a clock reading into a word
   for (const run of splitPhrases(text, phrases)) {
     if (run.phrase) {
-      out.push({ t: "w", word: run.text, display: run.text, isPhrase: true, idx: idx++ });
+      out.push({ t: "w", word: run.text, display: run.text, isPhrase: true, idx: idx++, at });
+      at += run.text.length;
       continue;
     }
     for (const tok of run.text.split(/(\s+)/)) {
       if (!tok) continue;
       const w = tok.match(WORD);
-      if (w) out.push({ t: "w", word: w[0], display: tok, isPhrase: false, idx: idx++ });
+      if (w) out.push({ t: "w", word: w[0], display: tok, isPhrase: false, idx: idx++, at });
       else out.push({ t: "txt", display: tok });
+      at += tok.length;
     }
   }
   return out;

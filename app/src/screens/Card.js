@@ -1,8 +1,23 @@
 const React = require("react");
 const { useState } = React;
 const { View, Text, Pressable, ScrollView, Linking, Switch } = require("react-native");
+const Speech = require("expo-speech");
 const { C, S } = require("../theme");
 const { markTarget } = require("../logic");
+
+// Stop before speaking: expo-speech queues, so tapping twice would otherwise say it twice in a
+// row rather than starting again — which is what a second tap means.
+const Speak = ({ text, size }) => (
+  <Pressable
+    hitSlop={12}
+    onPress={() => {
+      Speech.stop();
+      Speech.speak(text, { language: "en-US" });
+    }}
+  >
+    <Text style={{ fontSize: size, color: C.dim }}>🔊</Text>
+  </Pressable>
+);
 
 const mmss = (t) =>
   t == null ? "" : `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
@@ -53,10 +68,18 @@ function Card({ card, index, total, mastered, recall, onRecall, onGrade, onMaste
           </View>
         </View>
 
-        <Text style={{ fontSize: 32, fontWeight: "700", textAlign: "center", marginTop: 32, color: C.text }}>
-          {recall && !shown ? "____" : card.word}
-        </Text>
+        {/* The speaker stays put while the headword is blanked, exactly as on the desktop card:
+            hearing a word you are trying to produce is a cue, and asking for it is the reader's
+            call. */}
+        <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 12, marginTop: 32 }}>
+          <Text style={{ fontSize: 32, fontWeight: "700", color: C.text }}>
+            {recall && !shown ? "____" : card.word}
+          </Text>
+          <Speak text={card.word} size={22} />
+        </View>
 
+        {/* The sentence carries the same word, marked — so while the headword is withheld this
+            has to be withheld with it, or the answer sits in plain sight under the blank. */}
         <Text style={{ fontSize: 17, lineHeight: 30, textAlign: "center", marginTop: 24, color: "#444" }}>
           {markTarget(card.sentence ?? "", card.word).map((r, i) =>
             r.hit ? (
@@ -64,13 +87,19 @@ function Card({ card, index, total, mastered, recall, onRecall, onGrade, onMaste
                 key={i}
                 style={{ color: C.blue, fontWeight: "600", backgroundColor: "#e8efff" }}
               >
-                {r.text}
+                {recall && !shown ? "_".repeat(r.text.length) : r.text}
               </Text>
             ) : (
               <Text key={i}>{r.text}</Text>
             ),
           )}
         </Text>
+
+        {card.sentence ? (
+          <View style={{ alignItems: "center", marginTop: 10 }}>
+            <Speak text={card.sentence} size={16} />
+          </View>
+        ) : null}
 
         {card.zh ? (
           zh ? (

@@ -362,24 +362,36 @@ function wire() {
 
     // 主動回憶: the headword is withheld so the sentence has to do the retrieving.
     $("front").replaceChildren($("recall").checked ? "____" : card.word, speaker(card.word));
-    $("ctx").replaceChildren(
-      ...markTarget(card.sentence, card.word).map((r) =>
-        r.hit ? el("span", "hit", r.text) : document.createTextNode(r.text),
-      ),
-      speaker(card.sentence ?? ""),
-    );
-
     $("zh").hidden = true;
     $("zh").textContent = card.zh ?? "";
     $("showzh").hidden = !card.zh;
     $("back").hidden = true;
     $("reveal").hidden = false;
+    // After `back` is hidden, never before: paintCtx reads it to decide whether this card's
+    // answer is still being withheld, and the previous card left it showing.
+    paintCtx();
+  }
+
+  // 主動回憶 withholds the headword — but the sentence carries the same word, marked, so leaving
+  // it painted put the answer on screen underneath the blank. Blank it here too, and restore it
+  // the moment the answer is asked for.
+  function paintCtx() {
+    const hide = $("recall").checked && $("back").hidden;
+    $("ctx").replaceChildren(
+      ...markTarget(card.sentence, card.word).map((r) =>
+        r.hit
+          ? el("span", "hit", hide ? "_".repeat(r.text.length) : r.text)
+          : document.createTextNode(r.text),
+      ),
+      speaker(card.sentence ?? ""),
+    );
   }
 
   function reveal() {
     $("reveal").hidden = true;
     $("back").hidden = false;
     $("front").replaceChildren(card.word, speaker(card.word)); // recall mode: the answer, at last
+    paintCtx(); // `back` is visible now, so the sentence comes back with it
     $("contextZh").textContent = card.contextZh ?? "";
     $("context").textContent = card.context ?? "";
     $("senses").replaceChildren(
@@ -450,6 +462,7 @@ function wire() {
     // Only re-blank while the answer is still hidden; after 顯示解釋 the word stays visible.
     if (card && !$("card").hidden && $("back").hidden) {
       $("front").replaceChildren(e.target.checked ? "____" : card.word, speaker(card.word));
+      paintCtx();
     }
   });
   $("showzh").addEventListener("click", () => {

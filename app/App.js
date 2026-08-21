@@ -4,7 +4,7 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 
 import { C, S } from "./src/theme";
-import { loadSettings } from "./src/store";
+import { loadSettings, saveRecall } from "./src/store";
 import { enableDaily } from "./src/notify";
 import { pull, push } from "./src/cloud";
 import { buildQueue, schedule, dayKey } from "./src/logic";
@@ -70,6 +70,7 @@ export default function App() {
   useEffect(() => {
     loadSettings().then((c) => {
       setCfg(c);
+      setRecall(c.recall);
       sync(c);
       // Re-arm on every launch. An OS-held schedule can vanish — a reinstall, a permission
       // revoked and restored, an aggressive battery optimiser — and a reminder that silently
@@ -308,7 +309,10 @@ export default function App() {
           total={session.queue.length}
           mastered={session.mastered}
           recall={recall}
-          onRecall={setRecall}
+          onRecall={(on) => {
+            setRecall(on);
+            saveRecall(on).catch(() => {}); // a lost preference is a checkbox, not data
+          }}
           onGrade={grade}
           onMaster={master}
           onSkip={skip}

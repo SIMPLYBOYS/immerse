@@ -1,5 +1,6 @@
 const assert = require("assert");
-const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl, CLAUSE } = require("./content.js");
+const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, cueUrl,
+  CLAUSE } = require("./content.js");
 
 // --- parseReply ---
 const reply = parseReply(`CONTEXT: "Grew into" means developed into something larger.
@@ -387,7 +388,33 @@ assert.deepEqual(sumCounts(diffCounts({ d1: 900 }, { d1: 300 }), { d1: 300 }), {
 // Tombstones expire, or the file grows forever.
 assert.deepEqual(pruneDeleted({ old: T0 - 100 * DAY, recent: T0 - DAY }, T0), { recent: T0 - DAY });
 
+
 console.log("ok");
+
+// --- spokenIdx: which word is being read aloud ---
+// Tokens as the reader builds them: `at` is the offset into the sentence, `idx` counts words.
+const sp = { text: "one two three four", start: 10, end: 14 }; // 18 chars over 4 seconds
+const spTok = [
+  { t: "w", idx: 0, at: 0 },
+  { t: "txt", at: 3 },
+  { t: "w", idx: 1, at: 4 },
+  { t: "txt", at: 7 },
+  { t: "w", idx: 2, at: 8 },
+  { t: "txt", at: 13 },
+  { t: "w", idx: 3, at: 14 },
+];
+assert.equal(spokenIdx(spTok, sp, 10), 0); // the instant it opens
+assert.equal(spokenIdx(spTok, sp, 11), 1); // a quarter through: 4.5 chars in
+assert.equal(spokenIdx(spTok, sp, 13.9), 3); // last word, just before the line ends
+// Outside the sentence nothing is lit — otherwise every row would highlight its last word for
+// the whole video, which is worse than no effect at all.
+assert.equal(spokenIdx(spTok, sp, 9.9), -1);
+assert.equal(spokenIdx(spTok, sp, 14), -1);
+// A sentence with no duration cannot be interpolated; it must not divide by zero.
+assert.equal(spokenIdx(spTok, { text: "x", start: 5, end: 5 }, 5), -1);
+assert.equal(spokenIdx(spTok, { text: "x", start: 5, end: Infinity }, 6), -1);
+// What lights up is always a word, never the punctuation between them.
+assert.ok(spTok.some((x) => x.t === "w" && x.idx === spokenIdx(spTok, sp, 12.5)));
 
 // --- markTarget: the review card highlights the phrase inside its own sentence ---
 assert.deepEqual(markTarget("Hello there. As you can see, I'm not in.", "as you can see"), [

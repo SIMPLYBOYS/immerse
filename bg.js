@@ -270,7 +270,7 @@ async function saveTx(tx) {
     ]);
     if (!sync.on) return { ok: false, error: "同步未啟用" };
     const { ghToken, ghRepo } = await ghCfg();
-    if (txIndex[tx.videoId]) {
+    if (txIndex[tx.videoId]?.v === tx.v) {
       // Nothing new to upload — but the index may never have been written (it was added after
       // some transcripts already existed) or may have been deleted. Publish it once so the phone
       // can see what is already there, rather than waiting for the next unseen video.
@@ -281,7 +281,7 @@ async function saveTx(tx) {
       return { ok: true, skipped: true };
     }
     await ghPut(ghRepo, ghToken, `tx/${tx.videoId}.json`, JSON.stringify(tx));
-    txIndex[tx.videoId] = { title: tx.title, at: tx.at, n: tx.sentences.length };
+    txIndex[tx.videoId] = { title: tx.title, at: tx.at, n: tx.sentences.length, v: tx.v };
     await chrome.storage.local.set({ txIndex });
     // An index beside the transcripts, so the phone can list what is available with one request
     // instead of downloading every transcript just to read its title. Only this device writes it.

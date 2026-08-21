@@ -186,6 +186,30 @@ function zhFor(zhCues, s) {
   return cues.map((c) => c.text).join("");
 }
 
+// Which word of a sentence is being spoken at time t, by character position.
+//
+// ponytail: interpolated, not measured. YouTube does ship per-word offsets in its json3 captions,
+// but they would have to survive toSentences, which concatenates cues and re-splits them on
+// punctuation — the function every other feature here depends on. The same character-proportional
+// estimate already runs inside it to place a sentence that starts mid-cue, and that is the fix
+// that stopped S replaying from the wrong word. Error is zero at both ends of a sentence and
+// largest in the middle of a long one. If the highlight visibly drags behind the voice, carry
+// tOffsetMs through toSentences and store real word times in the transcript instead.
+//
+// `tokens` are the reader's own tokens, each carrying `at` — its offset into `s.text`.
+function spokenIdx(tokens, s, t) {
+  const dur = s.end - s.start;
+  // An open-ended sentence cannot be interpolated: every position would come out as zero and the
+  // first word would sit lit for the rest of the video. Nothing lit is the honest answer.
+  if (!Number.isFinite(dur) || dur <= 0 || t < s.start || t >= s.end) return -1;
+  const pos = ((t - s.start) / dur) * s.text.length;
+  let hit = -1;
+  for (const tk of tokens) {
+    if (tk.t === "w" && tk.at <= pos) hit = tk.idx;
+  }
+  return hit;
+}
+
 // Build the timedtext URL for a fetch. The stashed URL may already carry tlang=… — when the
 // player itself is displaying an auto-translated track — and must be stripped, or the "English"
 // pipeline (sentences, phrases, POS) silently runs on the translated text. YouTube renders one
@@ -361,13 +385,22 @@ function start_() {
     askOnce({
       type: "tx-save",
       tx: {
-        v: 1,
+        // Bumped when the shape changes, so a stale transcript is rewritten the next time the
+        // video is opened. v4 ships the translated cues untouched and lets the reader show
+        // whichever one is playing; v1-v3 each tried to hand every sentence "its" translation
+        // and each failed differently — see the note above zhCues below.
+        v: 4,
         videoId,
         title: document.title.replace(/ - YouTube$/, ""),
         at: Date.now(),
         sentences: trim(state.sentences),
         clauses: trim(state.clauses),
-        zh: state.sentences.map((s) => zhFor(zhCues, s)),
+        // The translated cues exactly as YouTube timed them. Three attempts at splitting them
+        // per English sentence all failed — a cue straddles sentence boundaries, the translation
+        // is not proportional to the English it replaces, and the track's timings run behind the
+        // English one — so the pairing was always a guess. Against the CLOCK there is no guess:
+        // the cue playing now is the translation of what is being said now.
+        zhCues: trim(zhCues),
         phrases: state.phrases,
         pos: state.pos,
       },
@@ -1055,4 +1088,5 @@ function start_() {
 
 if (typeof document !== "undefined") start_();
 if (typeof module !== "undefined")
-  module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, cueUrl, CLAUSE, WORD };
+  module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor,
+    spokenIdx, cueUrl, CLAUSE, WORD };
