@@ -19,7 +19,8 @@ const Speech = require("expo-speech");
 const { C, S, POS } = require("../theme");
 const { splitPhrases, posOf, parseReply, spokenIdx, WORD } = require("../logic");
 const { listTx, getTx } = require("../cloud");
-const { loadHidden, hideVideo, loadSplit, saveSplit } = require("../store");
+const { loadHidden, hideVideo, unhideVideo, loadSplit, saveSplit } = require("../store");
+const { VERSION } = require("../shared/version");
 const { explain } = require("../ai");
 
 // Watching, not just reading. The video plays, the line being spoken lights up and scrolls
@@ -77,7 +78,7 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
   // Struck off this phone's list, not deleted from the repo — so it can always be opened again by
   // pasting the id above, which is why there is no separate undo.
   const hide = (id, title) =>
-    Alert.alert("移除這支影片？", `${title}\n\n只從這支手機的清單移除，逐字稿還在雲端。之後貼上網址或影片 ID 就能再開。`, [
+    Alert.alert("移除這支影片？", `${title}\n\n只從這支手機的清單移除，逐字稿還在雲端。之後貼上網址或影片 ID 重新開啟，卡片就會回到清單。`, [
       { text: "取消", style: "cancel" },
       {
         text: "移除",
@@ -94,11 +95,12 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
     ]);
 
   const refresh = useCallback(() => {
-    if (!cfg?.repo || !cfg?.token) return;
-    listTx(cfg.repo, cfg.token)
+    if (!cfg?.repo || !cfg?.token) return Promise.resolve();
+    return listTx(cfg.repo, cfg.token)
       .then(setIndex)
       .catch((e) => setErr(String(e?.message ?? e)));
   }, [cfg]);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(refresh, [refresh]);
 
@@ -107,6 +109,8 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
     setErr(null);
     try {
       setTx(await getTx(cfg.repo, cfg.token, videoId));
+      // Opened deliberately (only the paste box can reach a hidden id) — put its card back.
+      if ((hidden ?? []).includes(videoId)) unhideVideo(videoId).then(setHidden).catch(() => {});
     } catch {
       // On-device capture was ruled out — YouTube only hands captions to its own player, and that
       // player cannot be reached inside a mobile WebView. The desktop, legitimately watching, is
@@ -170,9 +174,22 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
       <FlatList
         data={items}
         keyExtractor={([id]) => id}
+        // The list is fetched when the screen mounts and then sits; a transcript uploaded while
+        // the app stayed open never appeared until the screen was re-entered, which read as "the
+        // upload failed". Pulling down is the standing gesture for "ask again".
+        refreshing={refreshing}
+        onRefresh={() => {
+          setRefreshing(true);
+          refresh().finally(() => setRefreshing(false));
+        }}
         contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
         ListHeaderComponent={
           items.length ? <Text style={[S.sub, { marginBottom: 8 }]}>桌機看過的影片</Text> : null
+        }
+        ListFooterComponent={
+          <Text style={[S.sub, { fontSize: 11, textAlign: "center", marginTop: 16, color: "#bbb" }]}>
+            immerse v{VERSION}
+          </Text>
         }
         ListEmptyComponent={
           loading ? null : all.length ? (
@@ -209,6 +226,37 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
     </View>
   );
 }
+
+// Why play/pause never worked, and the two small bridges that make it work.
+//
+// react-native-youtube-iframe drives play and pause by posting a message into its player page.
+// Traced end to end with probes on a real phone, the message died twice on the way:
+//
+//   1. On Android, react-native-webview delivers a native postMessage as a MessageEvent on
+//      DOCUMENT with bubbles=false, while the player page listens on WINDOW — so the page never
+//      heard it. Re-dispatching document messages onto window closes that gap. (iOS dispatches on
+//      window to begin with, so there the first listener simply never fires.)
+//   2. The npm package sends {"eventName":"pauseVideo","meta":{}}, but the player page it loads
+//      from the author's site (iframe_v2.html) switches on the bare string "pauseVideo". The
+//      package and its own hosted page disagree, so even a delivered message matched nothing.
+//      Translating on window covers both platforms with the same lines.
+//
+// Everything that goes through the ref (seekTo, getCurrentTime) uses injectJavaScript instead and
+// always worked — which is what kept this hidden: the clock ran and seeking worked while the
+// play prop was silently a no-op, including the autoplay on open.
+const MESSAGE_BRIDGE = `
+(function () {
+  document.addEventListener("message", function (e) {
+    window.dispatchEvent(new MessageEvent("message", { data: e.data }));
+  });
+  window.addEventListener("message", function (e) {
+    var name = null;
+    try { name = JSON.parse(e.data).eventName; } catch (x) {}
+    if (name) window.dispatchEvent(new MessageEvent("message", { data: name }));
+  });
+})();
+true;
+`;
 
 // Far enough either way to be worth dragging, never so far that the other column disappears.
 const SPLIT = 0.6;
@@ -326,14 +374,31 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
   }, [playing, tx.sentences]);
 
   // Keep the spoken line on screen, unless the reader has taken the wheel by scrolling.
-  useEffect(() => {
-    if (!follow || cur < 0) return;
+  const followTo = (index, animated) => {
     try {
-      list.current?.scrollToIndex({ index: cur, viewPosition: 0.35, animated: true });
+      list.current?.scrollToIndex({ index, viewPosition: 0.35, animated });
     } catch {
-      // scrollToIndex throws for a row that has not been measured; the next update catches up
+      // a row that has not been measured; onScrollToIndexFailed below takes it from here
     }
+  };
+  useEffect(() => {
+    if (follow && cur >= 0) followTo(cur, true);
   }, [cur, follow]);
+
+  // Turning the phone re-wraps every line, so every row changes height and the positions the
+  // list measured are all wrong — it would sit on whatever pixel offset it had, showing some
+  // other part of the transcript, and nothing re-aims it on its own because `cur` has not
+  // changed. Re-aiming on onContentSizeChange was tried first and landed on stale numbers: that
+  // event is the content container's own layout, which arrives BEFORE the rows inside it report
+  // their new sizes, so the snap went to where the line used to be and the reader saw nothing
+  // happen until the next sentence. ponytail: two timed snaps instead — one as soon as the rows
+  // have had a frame to measure, one after the dust settles (the video column resizing beside
+  // the list triggers a second layout pass). Both without animation, so they read as one move.
+  const listW = useRef(0);
+  const reaim = useRef(() => {});
+  reaim.current = () => {
+    if (follow && cur >= 0) followTo(cur, false);
+  };
 
   const openInYouTube = (sec = 0) =>
     Linking.openURL(`https://youtu.be/${tx.videoId}?t=${Math.floor(Math.max(0, sec))}`);
@@ -399,10 +464,26 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
     return ws.length ? ws[ws.length - 1].idx : 0;
   };
 
+  // Looking a word up pauses the video — reading an explanation while the audio runs on means
+  // losing the thread of both. Same rule as the desktop's freeze/thaw: remember whether the pause
+  // was ours, and on close resume only then, so a video the reader paused themselves stays put.
+  const pausedByUs = useRef(false);
   const onWordPress = (line, idx, word) => {
     const s = tx.sentences[line];
+    if (playing) {
+      pausedByUs.current = true;
+      setWant(false);
+    }
     setSel({ range: { line, from: idx, to: idx } }); // the range first, the explanation merges in
     explainSel(word, s.text, s.start);
+  };
+
+  const closeSheet = () => {
+    setSel(null);
+    if (pausedByUs.current) {
+      pausedByUs.current = false;
+      setWant(true);
+    }
   };
 
   // side: "L" | "R", step: -1 shrinks, +1 grows
@@ -462,12 +543,15 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
               play={want}
               videoId={tx.videoId}
               initialPlayerParams={{ modestbranding: true, rel: false }}
+              webViewProps={{ injectedJavaScript: MESSAGE_BRIDGE }}
               onChangeState={(s) => {
                 // Keep the request in step with reality — started from the player's own button,
                 // the request must agree, or a later render could hand it a stale play={false}.
                 if (s === "playing") {
                   setPlaying(true);
                   setWant(true);
+                  // Started by any means, our pause is over — a later pause is theirs to keep.
+                  pausedByUs.current = false;
                 }
                 // Paused from the player's own controls: stop asking, or the next render would
                 // hand it play={true} again and fight the person who just pressed pause.
@@ -516,7 +600,21 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
             keyExtractor={(_, i) => String(i)}
             contentContainerStyle={{ padding: 16, paddingBottom: zhOn ? 120 : 40 }}
             onScrollBeginDrag={() => setFollow(false)} // taking the wheel turns off autopilot
-            onScrollToIndexFailed={() => {}}
+            onLayout={(e) => {
+              const w = e.nativeEvent.layout.width;
+              const turned = listW.current && w !== listW.current;
+              listW.current = w;
+              if (!turned) return;
+              setTimeout(() => reaim.current(), 60);
+              setTimeout(() => reaim.current(), 350);
+            }}
+            // The target row is off-screen and unmeasured (a long jump, or everything just
+            // re-wrapped). Land near it from the average row height so it renders, then aim
+            // properly once it has a real size.
+            onScrollToIndexFailed={({ index, averageItemLength }) => {
+              list.current?.scrollToOffset({ offset: averageItemLength * index, animated: false });
+              setTimeout(() => followTo(index, false), 120);
+            }}
             renderItem={({ item, index }) => (
               <Line
                 tokens={lineTokens[index]}
@@ -534,7 +632,7 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
             )}
           />
 
-          {zhOn && !perr && <ZhBar cues={tx.zhCues ?? []} player={player} playing={playing} />}
+          {zhOn && !perr && <ZhBar zh={tx.zh} cur={cur} />}
         </View>
       </View>
 
@@ -545,47 +643,29 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
           onMark={onMark}
           onExpand={expand}
           onLookup={lookup}
-          onClose={() => setSel(null)}
+          onClose={closeSheet}
         />
       )}
     </View>
   );
 }
 
-// The translated line for the moment being played.
+// The translation of the sentence being spoken — ours, stored beside the sentence it belongs to.
 //
-// Not "the translation of this sentence" — that pairing was tried three times and is not
-// obtainable from this data: a translated cue straddles English sentence boundaries, its length
-// is not proportional to the English it replaces, and the track runs behind the English one, so
-// every split was a guess that showed up as blank lines and mismatched text. Asked against the
-// clock instead, there is nothing to guess: whatever cue is playing IS the translation of what
-// is being said.
-//
-// It polls the player itself and keeps its own state so that a new cue redraws this one line and
-// not the whole transcript — holding the clock in the screen above is what made the list jitter.
-function ZhBar({ cues, player, playing }) {
-  const [i, setI] = useState(-1);
-
-  useEffect(() => {
-    if (!playing || !cues.length) return;
-    const iv = setInterval(async () => {
-      try {
-        const t = await player.current?.getCurrentTime();
-        if (typeof t !== "number") return;
-        const n = cues.findIndex((c) => t >= c.start && t < c.end);
-        setI((c) => (c === n ? c : n));
-      } catch {
-        // not ready yet, or gone — the next tick will do
-      }
-    }, 500);
-    return () => clearInterval(iv);
-  }, [playing, cues, player]);
-
+// Not YouTube's Chinese track. For auto-generated captions YouTube translates a whole paragraph
+// and deals the Chinese back across the original cue timings by proportion, so what any cue holds
+// lags or leads the speech by up to several sentences, drifting through the paragraph; pairing
+// that track with our sentences by time was tried four ways and failed four ways. The desktop now
+// translates each sentence itself (ZH_SYSTEM in prompts.js) and files the result index-aligned
+// with the sentences, so this is a lookup, not a guess. It changes when `cur` does.
+function ZhBar({ zh, cur }) {
+  const have = Array.isArray(zh) && zh.length > 0;
   return (
-    // Floated over the transcript rather than stacked above it. A cue is 13 characters at the
-    // median but 5% run past three lines, and a bar in the layout would shove the whole list up
-    // and down as it resized — the jitter this screen just got rid of. Over the top it can be as
-    // tall as the line needs without moving anything, and nothing gets cut off.
+    // Floated over the transcript rather than stacked above it: a bar in the layout would shove
+    // the whole list up and down as it resized — the jitter this screen just got rid of. No line
+    // cap: the cap dated from YouTube's cues, which ran to 220 characters because one spanned
+    // several sentences; a sentence's own translation is as long as the sentence, and cutting it
+    // off with an ellipsis read as a translation that had stopped halfway.
     <View
       style={{
         position: "absolute", left: 0, right: 0, bottom: 0,
@@ -594,8 +674,8 @@ function ZhBar({ cues, player, playing }) {
       }}
       pointerEvents="none"
     >
-      <Text style={{ fontSize: 15, lineHeight: 22, color: cues.length ? C.text : C.dim }}>
-        {cues.length ? cues[i]?.text ?? "" : "這份逐字稿沒有中文軌（舊版）。在桌機重開一次這支影片就會補上。"}
+      <Text style={{ fontSize: 15, lineHeight: 22, color: have ? C.text : C.dim }}>
+        {have ? zh[cur] ?? "" : "這份逐字稿還沒有逐句翻譯。在桌機重開一次這支影片就會補上。"}
       </Text>
     </View>
   );

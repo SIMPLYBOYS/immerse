@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, cueUrl,
+const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, parseZh, cueUrl,
   CLAUSE } = require("./content.js");
 
 // --- parseReply ---
@@ -415,6 +415,17 @@ assert.equal(spokenIdx(spTok, { text: "x", start: 5, end: 5 }, 5), -1);
 assert.equal(spokenIdx(spTok, { text: "x", start: 5, end: Infinity }, 6), -1);
 // What lights up is always a word, never the punctuation between them.
 assert.ok(spTok.some((x) => x.t === "w" && x.idx === spokenIdx(spTok, sp, 12.5)));
+
+// --- parseZh: numbered lines back to their sentences, holes rather than shifts ---
+assert.deepEqual(parseZh("0\t第一句\n1\t第二句\n2\t第三句", 3), ["第一句", "第二句", "第三句"]);
+// A skipped line is a hole; everything after it stays on its own sentence.
+assert.deepEqual(parseZh("0\t甲\n2\t丙", 3), ["甲", "", "丙"]);
+// Out-of-range numbers and chatter are ignored; a repeated number keeps the first answer.
+assert.deepEqual(parseZh("Sure!\n0\t甲\n7\t乙\n0\t改", 2), ["甲", ""]);
+// Whitespace around the number and tab is tolerated; a line with no text is a hole.
+assert.deepEqual(parseZh(" 1 \t 乙 \n0\t", 2), ["", "乙"]);
+assert.deepEqual(parseZh("", 2), ["", ""]);
+assert.deepEqual(parseZh(undefined, 0), []);
 
 // --- markTarget: the review card highlights the phrase inside its own sentence ---
 assert.deepEqual(markTarget("Hello there. As you can see, I'm not in.", "as you can see"), [

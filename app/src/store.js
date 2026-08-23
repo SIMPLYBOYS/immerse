@@ -90,5 +90,17 @@ async function loadSplit(fallback) {
 
 const saveSplit = (r) => SecureStore.setItemAsync(KEYS.split, String(r));
 
+// Opening a hidden video by pasting its id is as deliberate as hiding was — the card comes back.
+// Without this there was no way back onto the list at all: the paste box could OPEN the video,
+// but the removal stood forever, which bit the first time someone hid a broken transcript and
+// then fixed it.
+async function unhideVideo(id) {
+  const cur = await loadHidden();
+  if (!cur.includes(id)) return cur;
+  const next = cur.filter((x) => x !== id);
+  await SecureStore.setItemAsync(KEYS.hidden, JSON.stringify(next));
+  return next;
+}
+
 module.exports = { loadSettings, saveSettings, saveReminder, saveRecall, loadHidden, hideVideo,
-  loadSplit, saveSplit };
+  unhideVideo, loadSplit, saveSplit };

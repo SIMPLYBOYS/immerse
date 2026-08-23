@@ -210,6 +210,18 @@ function spokenIdx(tokens, s, t) {
   return hit;
 }
 
+// The model's numbered translation lines back into an array aligned with the sentences. A line
+// it skipped, or one it numbered wrongly, leaves a hole rather than shifting every later sentence
+// onto the wrong translation — the failure this whole feature exists to prevent.
+function parseZh(raw, n) {
+  const out = Array.from({ length: n }, () => "");
+  for (const line of String(raw ?? "").split("\n")) {
+    const m = line.match(/^\s*(\d+)\s*\t\s*(.*\S)\s*$/);
+    if (m && +m[1] < n && !out[+m[1]]) out[+m[1]] = m[2];
+  }
+  return out;
+}
+
 // Build the timedtext URL for a fetch. The stashed URL may already carry tlang=… — when the
 // player itself is displaying an auto-translated track — and must be stripped, or the "English"
 // pipeline (sentences, phrases, POS) silently runs on the translated text. YouTube renders one
@@ -224,7 +236,7 @@ function cueUrl(url, tlang) {
 
 function start_() {
   const state = { captures: [], open: null, anchor: null, marks: {}, zhOn: false, blurOn: false,
-    trackUrl: null, cues: [], sentences: [], clauses: [], zhCues: [], phrases: [], pos: {},
+    trackUrl: null, cues: [], sentences: [], clauses: [], zhCues: [], zh: [], phrases: [], pos: {},
     explains: new Map() }; // word|sentence → in-flight or settled explanation, so a re-click never re-bills
   window.__im = state;
 
@@ -342,11 +354,19 @@ function start_() {
     // No video id means a homepage/preview player fired this request. There is nothing to study
     // and no cache key to file under — and hover-previews must not burn phrase/POS calls.
     // trackUrl is deliberately left unset so the real watch page re-evaluates from scratch.
-    if (!new URLSearchParams(location.search).get("v")) return;
+    const pageId = new URLSearchParams(location.search).get("v");
+    if (!pageId) return;
+    // A timedtext URL names the video whose captions it carries. When an ad with captions plays,
+    // the player requests the AD's track — on a watch page whose address still says the real
+    // video — and one polluted transcript went through the whole pipeline and into the cloud
+    // that way. The mismatch is the tell; the real track arrives after the ad and passes.
+    const trackId = new URL(url, location.origin).searchParams.get("v");
+    if (trackId && trackId !== pageId) return;
     state.trackUrl = url;
     // Remember whether the on-screen captions are a translated track, to hint the user below.
     state.translatedTrack = url.includes("tlang=");
     state.zhCues = [];
+    state.zh = [];
     state.phrases = [];
     state.pos = {};
     state.cues = await fetchCues(url);
@@ -360,7 +380,7 @@ function start_() {
     if (!state.sentences.length) return;
     // Save only after both land: the phrases and POS tags cost real money here, and shipping them
     // with the transcript is what lets the phone colour and box the same text for free.
-    await Promise.all([loadPhrases(), loadPos()]);
+    await Promise.all([loadPhrases(), loadPos(), loadZh()]);
     saveTranscript();
   }
 
@@ -386,27 +406,27 @@ function start_() {
       type: "tx-save",
       tx: {
         // Bumped when the shape changes, so a stale transcript is rewritten the next time the
-        // video is opened. v4 ships the translated cues untouched and lets the reader show
-        // whichever one is playing; v1-v3 each tried to hand every sentence "its" translation
-        // and each failed differently — see the note above zhCues below.
-        v: 4,
+        // video is opened. v5 carries our own per-sentence translation; v4 shipped YouTube's cues
+        // raw and paired them by time on the phone; v1-v3 split them per sentence. All four
+        // YouTube-based versions were wrong by the same mechanism — see ZH_SYSTEM in prompts.js.
+        v: state.zh.length ? 5 : 4,
         videoId,
         title: document.title.replace(/ - YouTube$/, ""),
         at: Date.now(),
         sentences: trim(state.sentences),
         clauses: trim(state.clauses),
-        // The translated cues exactly as YouTube timed them. Three attempts at splitting them
-        // per English sentence all failed — a cue straddles sentence boundaries, the translation
-        // is not proportional to the English it replaces, and the track's timings run behind the
-        // English one — so the pairing was always a guess. Against the CLOCK there is no guess:
-        // the cue playing now is the translation of what is being said now.
+        // Our own per-sentence translation, index-aligned with `sentences`. YouTube's cues are
+        // kept only as the desktop's stopgap while ours loads; the phone reads `zh`. If the
+        // translation failed this stays v4 so the next desktop visit tries again.
+        zh: state.zh.length ? state.zh : undefined,
         zhCues: trim(zhCues),
         phrases: state.phrases,
         pos: state.pos,
       },
     }).then((r) => {
       if (r?.error) console.warn("[immerse] 逐字稿未存檔：", r.error);
-      else if (!r?.skipped) console.log("[immerse] 逐字稿已存入雲端", videoId);
+      else if (r?.skipped) console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
+      else console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 5 : 4}`);
     });
   }
 
@@ -430,6 +450,37 @@ function start_() {
     );
     if (!cached && Object.keys(state.pos).length) setStore({ [key]: { raw, head } });
     console.log("[immerse]", Object.keys(state.pos).length, "words tagged");
+    repaint();
+  }
+
+  // Our own translation of every sentence, numbered so each comes back to the line it belongs
+  // to. Batched: a 20-minute talk is ~300 sentences and the whole thing in one reply would brush
+  // the output ceiling; and a batch that fails leaves holes in 80 lines, not in all of them.
+  // Cached per video like the others — about five cents of Haiku per talk, paid once.
+  async function loadZh() {
+    const key = `zh1_${new URLSearchParams(location.search).get("v")}`;
+    const full = state.sentences.map((s) => s.text).join(" ");
+    const head = full.slice(0, 80);
+    const hit = (await getStore(key))[key];
+    let raw = hit?.head === head ? hit.raw : undefined;
+    if (raw === undefined) {
+      const BATCH = 80;
+      const parts = [];
+      for (let i = 0; i < state.sentences.length; i += BATCH) {
+        const text = state.sentences
+          .slice(i, i + BATCH)
+          .map((s, k) => `${i + k}\t${s.text}`)
+          .join("\n");
+        const res = await ask({ type: "zh", text });
+        if (!res || res.error) return console.warn("[immerse] zh failed:", res?.error ?? "no reply");
+        parts.push(res.text ?? "");
+      }
+      raw = parts.join("\n");
+    }
+    state.zh = parseZh(raw, state.sentences.length);
+    const got = state.zh.filter(Boolean).length;
+    if (hit?.raw !== raw && got) setStore({ [key]: { raw, head } });
+    console.log("[immerse]", got, "/", state.sentences.length, "sentences translated");
     repaint();
   }
 
@@ -713,7 +764,7 @@ function start_() {
       if (!state.zhCues.length && state.trackUrl) {
         state.zhCues = await fetchCues(state.trackUrl, "zh-Hant");
       }
-      lines = state.sentences.map((s) => `${s.text}\n${zhFor(state.zhCues, s)}`);
+      lines = state.sentences.map((s, i) => `${s.text}\n${state.zh[i] || zhFor(state.zhCues, s)}`);
     }
     const title = document.title.replace(/ - YouTube$/, "");
     const vid = new URLSearchParams(location.search).get("v");
@@ -760,7 +811,9 @@ function start_() {
       // line under a zh track helps nobody. Say what to do instead of failing quietly.
       text = "YouTube 字幕是自動翻譯軌——請切回英文原文，中文對照改按 Z 顯示";
     } else if (state.zhOn && s) {
-      text = zhFor(state.zhCues, s);
+      // Ours when it has arrived; YouTube's cue meanwhile, which is roughly right and better
+      // than a blank line for the seconds the translation takes.
+      text = state.zh[playing()] || zhFor(state.zhCues, s);
     } else {
       el.style.display = "none";
       return;
@@ -1089,4 +1142,4 @@ function start_() {
 if (typeof document !== "undefined") start_();
 if (typeof module !== "undefined")
   module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor,
-    spokenIdx, cueUrl, CLAUSE, WORD };
+    spokenIdx, parseZh, cueUrl, CLAUSE, WORD };

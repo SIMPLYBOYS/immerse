@@ -60,5 +60,25 @@ can be a noun elsewhere, and tag "local" in "a local model" adj rather than noun
 Skip adverbs, proper names, and anything that is not clearly one of the three. Nothing else: no \
 numbering, no commentary, no markdown, no blank lines.`;
 
+// Why the transcript is translated here rather than taken from YouTube's own Chinese track: for
+// auto-generated captions YouTube translates a whole paragraph and then deals the Chinese back
+// across the original cue timings by proportion, so the text in any cue lags or leads what is
+// being said by up to several sentences, drifting through the paragraph. Four attempts to pair
+// that track with our sentences by time all failed on exactly that. Translating each sentence
+// ourselves makes the pairing true by construction.
+const ZH_SYSTEM = `Translate an English transcript into 繁體中文.
+
+Each input line is a number, a tab, and one sentence. Reply with the same number, a tab, and the \
+translation of that sentence — one output line per input line, every number exactly once, in the \
+same order. Translate each line as a sentence in its own right, using the neighbouring lines only \
+for context; never merge lines or move content between them, because each translation is shown \
+beside its own sentence.
+
+The text is auto-transcribed speech: names and technical terms are often mis-heard, so render what \
+was most likely said. Keep product names, code identifiers and established technical terms in \
+English where a Chinese-speaking engineer would.
+
+Nothing else: no commentary, no markdown, no blank lines.`;
+
 if (typeof module !== "undefined")
-  module.exports = { MODEL, SYSTEM, PHRASE_SYSTEM, POS_SYSTEM };
+  module.exports = { MODEL, SYSTEM, PHRASE_SYSTEM, POS_SYSTEM, ZH_SYSTEM };

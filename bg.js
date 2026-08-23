@@ -13,6 +13,8 @@ chrome.action.onClicked.addListener(() =>
 const JOBS = {
   phrases: (m) => claude(PHRASE_SYSTEM, m.text, 1000, "phrases"),
   pos: (m) => claude(POS_SYSTEM, m.text, 4000, "pos"),
+  // Batched by the content script at 80 sentences, so this ceiling is per batch, not per video.
+  zh: (m) => claude(ZH_SYSTEM, m.text, 6000, "zh"),
   // Sync messages from the options page. Interactive token on the button paths: it only pops an
   // auth window on first grant and is silent forever after.
   "sync-connect": () => syncNow(true),
@@ -252,15 +254,41 @@ async function ghPut(repo, token, name, body, sha) {
   try {
     return await put(sha ?? (await shaOf(repo, token, name)));
   } catch {
-    return await put(await shaOf(repo, token, name));
+    // The directory listing shaOf reads can trail a write by a moment. A save that raced a
+    // sibling save for the same file saw "no such file" there, sent no sha, and was refused with
+    // '"sha" wasn't supplied' — then asked the same stale listing again. The file itself is what
+    // the PUT is compared against, so ask it directly on the retry.
+    // ponytail: the single-file GET carries the content too and refuses files over 1MB; a
+    // transcript is ~100KB and the deck well under, so fine until a deck grows past that.
+    return await put((await shaOfFile(repo, token, name)) ?? (await shaOf(repo, token, name)));
   }
+}
+
+async function shaOfFile(repo, token, name) {
+  return (await gh(`/repos/${repo}/contents/${name}`, { token }))?.sha;
 }
 
 // A transcript is content, not per-device state: one file per video, written once, never merged
 // and never summed. It goes straight to the repo instead of through chrome.storage because a few
 // dozen of them would eat the 10MB local quota the deck already lives in. `txIndex` is a small
 // local note of what this device has pushed, so re-watching a video costs nothing.
+// One upload per video at a time. loadTrack fires more than once for the same video — YouTube
+// re-requests its captions with a fresh signature — and two saves in flight together both read
+// the same not-yet-updated txIndex, both proceeded, and the second one's directory lookup ran
+// before the first one's write showed up in it.
+const txInFlight = new Set();
+
 async function saveTx(tx) {
+  if (txInFlight.has(tx?.videoId)) return { ok: true, skipped: true };
+  txInFlight.add(tx?.videoId);
+  try {
+    return await saveTxOnce(tx);
+  } finally {
+    txInFlight.delete(tx?.videoId);
+  }
+}
+
+async function saveTxOnce(tx) {
   try {
     if (!tx?.videoId || !tx.sentences?.length) return { ok: false, error: "沒有逐字稿" };
     const { sync = {}, txIndex = {}, txIndexAt } = await chrome.storage.local.get([
@@ -270,7 +298,15 @@ async function saveTx(tx) {
     ]);
     if (!sync.on) return { ok: false, error: "同步未啟用" };
     const { ghToken, ghRepo } = await ghCfg();
-    if (txIndex[tx.videoId]?.v === tx.v) {
+    // Equal OR NEWER: a visit on which the translation call failed arrives as v4, and must not
+    // overwrite the v5 already up there — that would throw the translation away for a transient
+    // API error. The index is this device's own record of what it pushed, so it is the judge.
+    // The head guards the CONTENT the version number cannot see: the ad-caption incident stored
+    // a polluted transcript as v5, and every later save of the real text was then skipped as
+    // "already v5". If the text changed, it goes up again whatever the versions say. Entries
+    // written before heads were recorded re-upload once and are stamped.
+    const head = tx.sentences.map((x) => x.text).join(" ").slice(0, 80);
+    if ((txIndex[tx.videoId]?.v ?? 0) >= tx.v && txIndex[tx.videoId]?.head === head) {
       // Nothing new to upload — but the index may never have been written (it was added after
       // some transcripts already existed) or may have been deleted. Publish it once so the phone
       // can see what is already there, rather than waiting for the next unseen video.
@@ -278,15 +314,22 @@ async function saveTx(tx) {
         await ghPut(ghRepo, ghToken, "tx/index.json", JSON.stringify(txIndex));
         await chrome.storage.local.set({ txIndexAt: Date.now() });
       }
-      return { ok: true, skipped: true };
+      return { ok: true, skipped: true, v: txIndex[tx.videoId]?.v };
     }
     await ghPut(ghRepo, ghToken, `tx/${tx.videoId}.json`, JSON.stringify(tx));
-    txIndex[tx.videoId] = { title: tx.title, at: tx.at, n: tx.sentences.length, v: tx.v };
+    txIndex[tx.videoId] = { title: tx.title, at: tx.at, n: tx.sentences.length, v: tx.v, head };
     await chrome.storage.local.set({ txIndex });
     // An index beside the transcripts, so the phone can list what is available with one request
     // instead of downloading every transcript just to read its title. Only this device writes it.
-    await ghPut(ghRepo, ghToken, "tx/index.json", JSON.stringify(txIndex));
-    await chrome.storage.local.set({ txIndexAt: Date.now() });
+    // The transcript is already up by now, so a failure here must not be reported as "not
+    // saved": clear the stamp instead, and the next save of any video republishes the index.
+    try {
+      await ghPut(ghRepo, ghToken, "tx/index.json", JSON.stringify(txIndex));
+      await chrome.storage.local.set({ txIndexAt: Date.now() });
+    } catch (e) {
+      await chrome.storage.local.set({ txIndexAt: null });
+      console.warn("[immerse] 逐字稿已存，索引稍後補：", e?.message ?? e);
+    }
     return { ok: true };
   } catch (e) {
     return { ok: false, error: String(e?.message ?? e) };
@@ -365,13 +408,31 @@ async function ghRestore() {
 // session bumps `log`, so they are never stale for long.
 const PUSH_TRIGGERS = ["words", "marks", "log", "deleted"];
 chrome.storage.onChanged.addListener((ch, area) => {
-  if (area !== "local" || !PUSH_TRIGGERS.some((k) => ch[k])) return;
-  chrome.storage.local.get("sync").then(({ sync }) => {
-    if (sync?.on) chrome.alarms.create("im-push", { delayInMinutes: 0.5 });
-  });
+  if (area !== "local") return;
+  if (PUSH_TRIGGERS.some((k) => ch[k])) {
+    chrome.storage.local.get("sync").then(({ sync }) => {
+      if (sync?.on) chrome.alarms.create("im-push", { delayInMinutes: 0.5 });
+    });
+    return;
+  }
+  // Immersion seconds deliberately do NOT ride the 30-second debounce above: the clock flushes
+  // every 15 seconds, which would reschedule that alarm forever and push on every flush. But
+  // left out entirely — as they were — minutes from a session with no word marked never left
+  // the machine at all, and the phone's "today" was missing the desktop's watching until the
+  // next mark happened to push. Same rule as the app's five-minute heartbeat: an alarm measured
+  // from the OLDEST unpushed change, so it is created only when none is pending and never
+  // pushed back by later ticks.
+  if (ch.immersion || ch.immLog) {
+    chrome.storage.local.get("sync").then(({ sync }) => {
+      if (!sync?.on) return;
+      chrome.alarms.get("im-push-slow").then((a) => {
+        if (!a) chrome.alarms.create("im-push-slow", { delayInMinutes: 5 });
+      });
+    });
+  }
 });
 chrome.alarms.onAlarm.addListener((a) => {
-  if (a.name === "im-push") return syncNow();
+  if (a.name === "im-push" || a.name === "im-push-slow") return syncNow();
   if (a.name === "im-pull") return pullIfOn();
 });
 
