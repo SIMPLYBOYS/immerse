@@ -87,9 +87,18 @@ async function pull(repo, token, deviceId) {
       snaps.push(snap);
       if (f.name === mine) own = snap;
     } catch {
-      // One unreadable device file must not sink the whole pull.
+      // One unreadable SIBLING file must not sink the whole pull — its rows just arrive on the
+      // next one. Our own file is the exception, checked below.
     }
   }
+  // A partial pull must not masquerade as a clean empty state. Failing to read our OWN file while
+  // it exists in the cloud is how a device catches amnesia: "own" comes back empty, the session
+  // runs on top of nothing, and the next push overwrites the device's real history with the
+  // emptiness — which is exactly what happened to fifteen seconds of immersion once. Failing the
+  // pull is recoverable; the overwrite is not.
+  if (files.length && !snaps.length) throw new Error("讀不到任何裝置檔——網路或 GitHub 暫時有問題，稍後再試");
+  if (!own && files.some((f) => f.name === mine))
+    throw new Error("讀不到這支手機自己的雲端檔案。為了不把歷史蓋成空白，先不同步，稍後再試");
   return {
     deck: foldSnapshots(snaps),
     own, // this device's own contribution, so a push can rewrite it without double-counting
