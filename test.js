@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, parseZh, cueUrl,
+const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, parseZh, replayTarget, cueUrl,
   CLAUSE } = require("./content.js");
 
 // --- parseReply ---
@@ -426,6 +426,40 @@ assert.deepEqual(parseZh("Sure!\n0\t甲\n7\t乙\n0\t改", 2), ["甲", ""]);
 assert.deepEqual(parseZh(" 1 \t 乙 \n0\t", 2), ["", "乙"]);
 assert.deepEqual(parseZh("", 2), ["", ""]);
 assert.deepEqual(parseZh(undefined, 0), []);
+
+// --- replayTarget: S replays the sentence the ear just heard ---
+const rp = [
+  { start: 0, end: 10 },
+  { start: 10, end: 20 },
+  { start: 20, end: 30 },
+];
+// Deep inside a sentence: its own head.
+assert.equal(replayTarget(rp, 15, -1), 1);
+// A beat past a boundary, the press was aimed at the sentence that just landed.
+assert.equal(replayTarget(rp, 10.4, -1), 0);
+assert.equal(replayTarget(rp, 20.8, -1), 1);
+// ...but when S itself just put the clock there, another S loops rather than walking back.
+assert.equal(replayTarget(rp, 10.4, 1), 1);
+// After the looped sentence plays through into the next one, S goes back to it again.
+assert.equal(replayTarget(rp, 20.2, 1), 1);
+// The first sentence has nowhere earlier to go.
+assert.equal(replayTarget(rp, 0.2, -1), 0);
+// Outside the timeline: clamp to the nearest end.
+assert.equal(replayTarget(rp, 99, -1), 2);
+assert.equal(replayTarget([{ start: 5, end: 9 }], 1, -1), 0);
+
+// The double-press regression: replay lands REPLAY_LEAD (0.3s) before a sentence's start, and a
+// second S must loop THAT sentence, not step back into the previous one. Second sentence starts
+// at 10 → replay seeks to 9.7 → pressing S again must still target index 1.
+assert.equal(replayTarget(rp, 9.7, 1), 1);
+// The very first S at that landing spot (no prior replay) still resolves to the sentence it
+// precedes, not the one before it.
+assert.equal(replayTarget(rp, 9.7, -1), 1);
+// A press a beat into the loop keeps looping the same sentence.
+assert.equal(replayTarget(rp, 10.5, 1), 1);
+// The pre-roll of the last sentence (starts 20 → lands 19.7) targets the last sentence, not the
+// middle one.
+assert.equal(replayTarget(rp, 19.7, 2), 2);
 
 // --- markTarget: the review card highlights the phrase inside its own sentence ---
 assert.deepEqual(markTarget("Hello there. As you can see, I'm not in.", "as you can see"), [

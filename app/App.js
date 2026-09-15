@@ -31,6 +31,9 @@ export default function App() {
   const [err, setErr] = useState(null);
   const [tab, setTab] = useState("review");
   const [session, setSession] = useState(null);
+  // Bumped after every successful pull, so screens that fetch something of their own — the video
+  // list reads tx/index.json, not the deck — refetch on the same rhythm instead of only at mount.
+  const [syncTick, setSyncTick] = useState(0);
   const [recall, setRecall] = useState(false);
 
   // The AppState listener fires outside the render cycle, where captured state would be whatever
@@ -39,6 +42,7 @@ export default function App() {
   live.current = { cfg, deck, ownLog, ownImm, ownSha, session };
   const dirty = useRef(false);
   const dirtySince = useRef(0); // when the OLDEST unpushed change happened, not the newest
+  const pushAfterCommit = useRef(false); // finish() sets it; the effect below pushes post-commit
 
   const markDirty = () => {
     if (!dirty.current) dirtySince.current = Date.now();
@@ -61,6 +65,7 @@ export default function App() {
       setOwnImm(mine);
       pulledImm.current = mine.immLog;
       setOwnSha(r.ownSha);
+      setSyncTick((n) => n + 1);
     } catch (e) {
       setErr(String(e?.message ?? e));
     }
@@ -82,9 +87,12 @@ export default function App() {
   // One upload per session rather than one per card: a commit per grade would mean seventy
   // commits and seventy full-file uploads for one commute, each needing signal — the one thing a
   // commute does not have. The heartbeat below bounds how long that batching can hold data.
+  // Returns whether the deck is now safely up: true on a successful push OR when there was
+  // nothing to send, false when a push was attempted and failed. refresh() reads this to decide
+  // whether it is safe to pull — pulling after a failed push would overwrite unsent work.
   const pushNow = useCallback(async () => {
     const { cfg: c, deck: d, ownLog: log, ownImm: imm, ownSha: sha } = live.current;
-    if (!dirty.current || !c?.repo || !c?.token || !d) return;
+    if (!dirty.current || !c?.repo || !c?.token || !d) return true;
     const since = dirtySince.current;
     dirty.current = false;
     dirtySince.current = 0;
@@ -93,12 +101,14 @@ export default function App() {
       // device does not produce must stay out of its file or the fold would count them twice.
       const next = await push(c.repo, c.token, c.deviceId, { words: d.words, log, ...imm }, sha);
       setOwnSha(next);
+      return true;
     } catch (e) {
       dirty.current = true; // still pending: try again on the next chance rather than losing it
       // Keep the original age. Restamping it here would push the retry another full hold period
       // away, so a run of failures would quietly stretch the window it is meant to bound.
       dirtySince.current = since || Date.now();
       setErr(String(e?.message ?? e));
+      return false;
     }
   }, []);
 
@@ -108,7 +118,10 @@ export default function App() {
   const refresh = useCallback(async () => {
     const c = live.current.cfg;
     if (!c?.repo || !c?.token) return;
-    if (dirty.current) await pushNow();
+    // A pull replaces the deck wholesale, and the fold only knows what has been uploaded. So a
+    // pull after a FAILED push would replace unsent local work with older cloud data and lose it.
+    // Only pull once the local state is safely up there — otherwise stop and keep it for a retry.
+    if (dirty.current && !(await pushNow())) return;
     await sync(c);
   }, [pushNow, sync]);
 
@@ -128,6 +141,14 @@ export default function App() {
     }, MAX_HOLD);
     return () => clearInterval(iv);
   }, [refresh]);
+
+  // Drains the flag finish() sets. A no-dep effect runs after every commit; the guard makes it a
+  // no-op except on the render that just applied the final grade, when live.current now holds it.
+  useEffect(() => {
+    if (!pushAfterCommit.current) return;
+    pushAfterCommit.current = false;
+    pushNow();
+  });
 
   // A review session ends and uploads itself. Watching never ends: a reader can sit in the
   // foreground for an hour, and every word marked in that hour would be waiting on a background
@@ -222,9 +243,13 @@ export default function App() {
     if (queue.length) setSession({ queue, i: 0, mastered: 0, relearned: [] });
   };
 
+  // Push AFTER the grade commits, not from inside the grade handler. Calling pushNow() here would
+  // read live.current before React has re-rendered, uploading the deck WITHOUT the last card's
+  // row and log — then clearing dirty, so the last answer of every session was silently dropped.
+  // The flag is consumed by the effect below, which runs once the commit has refreshed live.current.
   const finish = () => {
     setSession(null);
-    pushNow();
+    pushAfterCommit.current = true;
   };
 
   const advance = (s) => (s.i + 1 >= s.queue.length ? finish() : setSession({ ...s, i: s.i + 1 }));
@@ -272,7 +297,7 @@ export default function App() {
         setCfg(c);
         sync(c);
       }}
-      onSync={() => sync(cfg)}
+      onSync={refresh}
       status={status}
       busy={busy}
     />
@@ -291,6 +316,7 @@ export default function App() {
       return (
         <Immerse
           cfg={cfg}
+          syncTick={syncTick}
           marks={deck.marks}
           onMark={markWord}
           onImmersion={addImmersion}

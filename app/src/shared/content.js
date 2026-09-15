@@ -222,6 +222,29 @@ function parseZh(raw, n) {
   return out;
 }
 
+// Which sentence S should replay. Not simply "the one the clock is in": sentence ends and
+// starts touch, so by the time a hand reacts to a sentence landing and presses S, the clock has
+// usually crossed into the next one — replaying THAT replays a sentence barely begun. So less
+// than a beat into a sentence, the one the ear wants back is the one before. Unless S itself
+// just put the clock here: that press means "loop this sentence", not "walk one further back",
+// which is what `last` — the index S replayed most recently — distinguishes.
+// replay() seeks REPLAY_LEAD before a sentence's start, so an interpolated start sitting on the
+// first word does not clip it. That landing spot falls inside the PREVIOUS sentence's range, so a
+// second S read it as "still in the previous sentence" and stepped one sentence back on every
+// press. Sentences are contiguous (each end === the next start), so shifting every boundary
+// earlier by the lead makes the landing spot belong to the sentence it precedes.
+const REPLAY_LEAD = 0.3;
+function replayTarget(sentences, t, last) {
+  let k = sentences.findIndex((x) => t >= x.start - REPLAY_LEAD && t < x.end - REPLAY_LEAD);
+  if (k < 0) k = t < (sentences[0]?.start ?? 0) ? 0 : sentences.length - 1;
+  // Pressed a beat INTO a sentence (a positive delta under ~0.9s) means the reaction lagged the
+  // boundary and the ear wanted the previous one. A NEGATIVE delta is the pre-roll landing spot,
+  // which belongs to this sentence on purpose — never step back from it, or a second S walks back.
+  const delta = t - sentences[k].start;
+  if (delta >= 0 && delta < 0.9 && last !== k) k = Math.max(0, k - 1);
+  return k;
+}
+
 // Build the timedtext URL for a fetch. The stashed URL may already carry tlang=… — when the
 // player itself is displaying an auto-translated track — and must be stripped, or the "English"
 // pipeline (sentences, phrases, POS) silently runs on the translated text. YouTube renders one
@@ -237,6 +260,7 @@ function cueUrl(url, tlang) {
 function start_() {
   const state = { captures: [], open: null, anchor: null, marks: {}, zhOn: false, blurOn: false,
     trackUrl: null, cues: [], sentences: [], clauses: [], zhCues: [], zh: [], phrases: [], pos: {},
+    replayed: -1,
     explains: new Map() }; // word|sentence → in-flight or settled explanation, so a re-click never re-bills
   window.__im = state;
 
@@ -363,16 +387,27 @@ function start_() {
     const trackId = new URL(url, location.origin).searchParams.get("v");
     if (trackId && trackId !== pageId) return;
     state.trackUrl = url;
+    // Snapshot the id and title now. The pipeline below awaits several times; if the user
+    // navigates A→B during those awaits, B's loadTrack overwrites the shared state and the URL,
+    // and a save that re-read location would file A's content under B's id and title. `stale()`
+    // checks the one flag B is guaranteed to have changed — state.trackUrl — after every await,
+    // so the superseded load bails instead of writing.
+    const videoId = pageId;
+    const title = document.title.replace(/ - YouTube$/, "");
+    const stale = () => state.trackUrl !== url;
     // Remember whether the on-screen captions are a translated track, to hint the user below.
     state.translatedTrack = url.includes("tlang=");
     state.zhCues = [];
     state.zh = [];
     state.phrases = [];
     state.pos = {};
+    state.replayed = -1;
     state.cues = await fetchCues(url);
+    if (stale()) return; // navigated to another video mid-fetch; that load now owns the state
     state.sentences = toSentences(state.cues);
     state.clauses = toSentences(state.cues, CLAUSE);
     if (state.zhOn) state.zhCues = await fetchCues(url, "zh-Hant");
+    if (stale()) return;
     console.log("[immerse]", state.sentences.length, "sentences from", state.cues.length, "cues");
     // Homepage preview players fire timedtext requests too, and those often yield no usable
     // cues — an empty transcript must never reach the model (the API rejects empty content,
@@ -381,15 +416,17 @@ function start_() {
     // Save only after both land: the phrases and POS tags cost real money here, and shipping them
     // with the transcript is what lets the phone colour and box the same text for free.
     await Promise.all([loadPhrases(), loadPos(), loadZh()]);
-    saveTranscript();
+    if (stale()) return; // B took over during the model calls — never save A's content as B
+    saveTranscript(videoId, title);
   }
 
   // Hand the whole transcript to the worker, which files it in the repo for the phone to read.
   // The phone cannot obtain this itself — YouTube refuses to play, and therefore to fetch its own
   // captions, inside a mobile WebView — so the desktop, which is legitimately watching anyway,
   // is the only place it can come from.
-  async function saveTranscript() {
-    const videoId = new URLSearchParams(location.search).get("v");
+  // videoId and title are passed in, snapshotted before the pipeline's awaits — never re-read
+  // from the live page here, or a mid-load navigation would mislabel this transcript.
+  async function saveTranscript(videoId, title) {
     if (!videoId || !state.sentences.length) return;
     // Fetch the Chinese track even when the Z line was never switched on. It is YouTube's own
     // translation of the same URL, so it costs nothing, and it is the last chance to get it: the
@@ -411,7 +448,7 @@ function start_() {
         // YouTube-based versions were wrong by the same mechanism — see ZH_SYSTEM in prompts.js.
         v: state.zh.length ? 5 : 4,
         videoId,
-        title: document.title.replace(/ - YouTube$/, ""),
+        title,
         at: Date.now(),
         sentences: trim(state.sentences),
         clauses: trim(state.clauses),
@@ -424,9 +461,19 @@ function start_() {
         pos: state.pos,
       },
     }).then((r) => {
-      if (r?.error) console.warn("[immerse] 逐字稿未存檔：", r.error);
-      else if (r?.skipped) console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
-      else console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 5 : 4}`);
+      // The upload is the moment the phone gains this video, so say it on screen — the console
+      // only ever told people it worked after they already doubted it. Failure gets a toast for
+      // the same reason, louder. "Already current" stays quiet: it is the outcome of most opens,
+      // and a toast that fires every time is one that stops being read.
+      if (r?.error) {
+        console.warn("[immerse] 逐字稿未存檔：", r.error);
+        toast(`逐字稿上傳失敗：${r.error}`, 0);
+      } else if (r?.skipped) {
+        console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
+      } else {
+        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 5 : 4}`);
+        toast("逐字稿已上傳，手機可以看了 ✓", 0);
+      }
     });
   }
 
@@ -550,6 +597,18 @@ function start_() {
     const k = Math.max(0, idxAt(list));
     const target = list[Math.min(list.length - 1, Math.max(0, k + delta))];
     if (target) v.currentTime = target.start;
+  }
+
+  // S: the whole sentence again, from its head. A and D walk by clause; replaying by clause
+  // restarted at the nearest comma — the middle of the thought, which read as being stuck on a
+  // random word. Landing a hair before the head, because an interpolated start can sit ON the
+  // first word and clip it.
+  function replay() {
+    const v = video();
+    if (!v || !state.sentences.length) return;
+    const k = replayTarget(state.sentences, v.currentTime, state.replayed);
+    state.replayed = k;
+    v.currentTime = Math.max(0, state.sentences[k].start - REPLAY_LEAD);
   }
 
   // --- clickable caption words ----------------------------------------------------------------
@@ -744,17 +803,39 @@ function start_() {
   // With the Z line on, each sentence is paired with YouTube's own zh-Hant translation, so the
   // export costs no API call either way. Plain text, no timestamps: it is for reading and for
   // pasting into notes, not for re-subtitling.
-  function toast(msg) {
+  // ms = 0 makes it a bubble that stays until its ✕ is clicked — for the messages someone must
+  // not miss just because they looked away for half a minute. Everything else fades on its own.
+  function toast(msg, ms = 2200) {
     let el = document.getElementById("im-toast");
     if (!el) {
       el = document.createElement("div");
       el.id = "im-toast";
-      document.body.appendChild(el);
     }
-    el.textContent = msg;
-    el.style.opacity = "1";
+    // In fullscreen only the fullscreened element's subtree is painted, and the upload lands
+    // ~30s into a video — right when someone has gone fullscreen — so a body-mounted toast plays
+    // to an empty room. Mount into the fullscreen element then, body otherwise. NOT #movie_player:
+    // it is overflow:hidden, and a position:fixed toast lands at the viewport bottom, outside the
+    // player box, where the clip eats it — which is exactly why the bubble stopped showing.
+    // document.fullscreenElement is whatever YouTube fullscreened (usually the player), and fixed
+    // positioning resolves to the viewport inside it. Re-appending each call follows SPA nav.
+    (document.fullscreenElement ?? document.body).appendChild(el);
+    el.replaceChildren(document.createTextNode(msg));
     clearTimeout(state.toastT);
-    state.toastT = setTimeout(() => (el.style.opacity = "0"), 2200);
+    // The sticky class carries pointer-events — the fading kind must stay click-through, and a
+    // faded-out sticky bubble must not keep blocking the video invisibly.
+    el.classList.toggle("im-stick", !ms);
+    if (ms) {
+      state.toastT = setTimeout(() => (el.style.opacity = "0"), ms);
+    } else {
+      const x = document.createElement("button");
+      x.textContent = "✕";
+      x.addEventListener("click", () => {
+        el.style.opacity = "0";
+        el.classList.remove("im-stick");
+      });
+      el.appendChild(x);
+    }
+    el.style.opacity = "1";
   }
 
   async function copyTranscript() {
@@ -1057,7 +1138,7 @@ function start_() {
       const focused = document.activeElement;
       // Don't hijack the search box or a comment field.
       if (focused && (focused.isContentEditable || /input|textarea/i.test(focused.tagName))) return;
-      const act = { a: () => seek(-1), s: () => seek(0), d: () => seek(1), z: toggleZh,
+      const act = { a: () => seek(-1), s: replay, d: () => seek(1), z: toggleZh,
         x: toggleBlur, e: copyTranscript }[e.key.toLowerCase()];
       if (!act) return;
       e.preventDefault();
@@ -1113,7 +1194,10 @@ function start_() {
     #im-pop .im-btns button.on{background:#4af;border-color:#4af;color:#000}
     #im-toast{position:fixed;left:50%;bottom:72px;transform:translateX(-50%);z-index:99999;
       background:#111e;color:#eee;padding:8px 16px;border-radius:999px;font:13px/1.4
-      -apple-system,system-ui,sans-serif;opacity:0;transition:opacity .3s;pointer-events:none}`;
+      -apple-system,system-ui,sans-serif;opacity:0;transition:opacity .3s;pointer-events:none}
+    #im-toast.im-stick{pointer-events:auto;display:flex;align-items:center;gap:10px}
+    #im-toast.im-stick button{all:unset;cursor:pointer;color:#aaa;font-size:13px;padding:0 2px}
+    #im-toast.im-stick button:hover{color:#fff}`;
 
   // The caption container is created/destroyed as CC toggles, so re-attach when it changes.
   const obs = new MutationObserver(tick);
@@ -1142,4 +1226,4 @@ function start_() {
 if (typeof document !== "undefined") start_();
 if (typeof module !== "undefined")
   module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor,
-    spokenIdx, parseZh, cueUrl, CLAUSE, WORD };
+    spokenIdx, parseZh, replayTarget, cueUrl, CLAUSE, WORD };

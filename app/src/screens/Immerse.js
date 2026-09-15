@@ -63,7 +63,7 @@ const mins = (sec) => {
   return m >= 60 ? `${Math.floor(m / 60)} 時 ${m % 60} 分` : `${m} 分`;
 };
 
-function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
+function Immerse({ cfg, syncTick, marks, onMark, onImmersion, todaySec }) {
   const [index, setIndex] = useState({});
   const [input, setInput] = useState("");
   const [err, setErr] = useState(null);
@@ -102,7 +102,12 @@ function Immerse({ cfg, marks, onMark, onImmersion, todaySec }) {
   }, [cfg]);
   const [refreshing, setRefreshing] = useState(false);
 
-  useEffect(refresh, [refresh]);
+  // At mount, and again whenever the deck has just been pulled (foreground, every five minutes):
+  // the list was fetched once and then sat, so a transcript the desktop uploaded while the app
+  // stayed open never appeared until someone thought to pull down — and read as "not uploaded".
+  useEffect(() => {
+    refresh();
+  }, [refresh, syncTick]);
 
   const open = async (videoId) => {
     setLoading(true);
