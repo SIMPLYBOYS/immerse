@@ -449,11 +449,11 @@ function start_() {
     askOnce({
       type: "tx-save",
       tx: {
-        // Bumped when the shape changes, so a stale transcript is rewritten the next time the
-        // video is opened. v5 carries our own per-sentence translation; v4 shipped YouTube's cues
-        // raw and paired them by time on the phone; v1-v3 split them per sentence. All four
-        // YouTube-based versions were wrong by the same mechanism — see ZH_SYSTEM in prompts.js.
-        v: state.zh.length ? 5 : 4,
+        // Bumped when the shape OR the translation changes, so a stale transcript is rewritten
+        // next time the video is opened. v6 re-translates with a prompt that stops the model
+        // swapping adjacent short fragments; v5 was the first per-sentence translation; v4 shipped
+        // YouTube's cues raw; v1-v3 split them per sentence — see ZH_SYSTEM in prompts.js.
+        v: state.zh.length ? 6 : 4,
         videoId,
         title,
         at: Date.now(),
@@ -478,7 +478,7 @@ function start_() {
       } else if (r?.skipped) {
         console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
       } else {
-        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 5 : 4}`);
+        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 6 : 4}`);
         toast("逐字稿已上傳，手機可以看了 ✓", 0);
       }
     });
@@ -512,7 +512,7 @@ function start_() {
   // the output ceiling; and a batch that fails leaves holes in 80 lines, not in all of them.
   // Cached per video like the others — about five cents of Haiku per talk, paid once.
   async function loadZh() {
-    const key = `zh1_${new URLSearchParams(location.search).get("v")}`;
+    const key = `zh2_${new URLSearchParams(location.search).get("v")}`;
     const full = state.sentences.map((s) => s.text).join(" ");
     const head = full.slice(0, 80);
     const hit = (await getStore(key))[key];

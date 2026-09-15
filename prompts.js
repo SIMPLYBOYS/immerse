@@ -70,9 +70,16 @@ const ZH_SYSTEM = `Translate an English transcript into 繁體中文.
 
 Each input line is a number, a tab, and one sentence. Reply with the same number, a tab, and the \
 translation of that sentence — one output line per input line, every number exactly once, in the \
-same order. Translate each line as a sentence in its own right, using the neighbouring lines only \
-for context; never merge lines or move content between them, because each translation is shown \
-beside its own sentence.
+same order.
+
+Line N's output must be the translation of line N's input and nothing else. The lines are shown one \
+per sentence beside the English, so content must never move between them. This matters most where \
+neighbouring lines are short auto-transcribed fragments: translate each fragment exactly where it \
+is, even when it reads as incomplete, and NEVER borrow a clause from the next line to finish it or \
+push part of this line onto the next. For example, given "14\tandrew ng on a course about LLMs" and \
+"15\tit looks like that's the case", line 14 must translate the course fragment and line 15 must \
+translate "it looks like that's the case" — not the reverse. Use neighbouring lines only to \
+understand meaning, never as a place to relocate words.
 
 The text is auto-transcribed speech: names and technical terms are often mis-heard, so render what \
 was most likely said. Keep product names, code identifiers and established technical terms in \
