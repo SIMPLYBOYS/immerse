@@ -476,7 +476,11 @@ function start_() {
         console.warn("[immerse] 逐字稿未存檔：", r.error);
         toast(`逐字稿上傳失敗：${r.error}`, 0);
       } else if (r?.skipped) {
+        // Not silent any more: replaying a video and seeing NOTHING read as "the upload isn't
+        // working". A brief auto-fading line (not the sticky bubble) confirms the desktop checked
+        // and the phone already has this one, without nagging on every open.
         console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
+        toast("逐字稿已是最新版，手機已有 ✓");
       } else {
         console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 6 : 4}`);
         toast("逐字稿已上傳，手機可以看了 ✓", 0);
