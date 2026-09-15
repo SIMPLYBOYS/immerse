@@ -393,7 +393,6 @@ function start_() {
     // checks the one flag B is guaranteed to have changed — state.trackUrl — after every await,
     // so the superseded load bails instead of writing.
     const videoId = pageId;
-    const title = document.title.replace(/ - YouTube$/, "");
     const stale = () => state.trackUrl !== url;
     // Remember whether the on-screen captions are a translated track, to hint the user below.
     state.translatedTrack = url.includes("tlang=");
@@ -417,17 +416,25 @@ function start_() {
     // with the transcript is what lets the phone colour and box the same text for free.
     await Promise.all([loadPhrases(), loadPos(), loadZh()]);
     if (stale()) return; // B took over during the model calls — never save A's content as B
-    saveTranscript(videoId, title);
+    saveTranscript(videoId);
   }
 
   // Hand the whole transcript to the worker, which files it in the repo for the phone to read.
   // The phone cannot obtain this itself — YouTube refuses to play, and therefore to fetch its own
   // captions, inside a mobile WebView — so the desktop, which is legitimately watching anyway,
   // is the only place it can come from.
-  // videoId and title are passed in, snapshotted before the pipeline's awaits — never re-read
-  // from the live page here, or a mid-load navigation would mislabel this transcript.
-  async function saveTranscript(videoId, title) {
+  // videoId is snapshotted at loadTrack entry (the URL is reliable immediately). The TITLE is
+  // read here, not there: on SPA navigation the timedtext request that triggers loadTrack often
+  // fires while document.title is still the transient "YouTube", before the real title loads, so
+  // an entry-time read mislabelled two transcripts in three. By now it has settled — provided we
+  // are still on this video, which the caller's stale() check plus this live URL re-check confirm
+  // (the re-check also closes the gap where the URL has already changed but the new load's
+  // timedtext has not yet fired, so state.trackUrl still points here).
+  async function saveTranscript(videoId) {
     if (!videoId || !state.sentences.length) return;
+    if (new URLSearchParams(location.search).get("v") !== videoId) return;
+    let title = document.title.replace(/ - YouTube$/, "");
+    if (!title || title === "YouTube") title = videoId; // never store the placeholder as a name
     // Fetch the Chinese track even when the Z line was never switched on. It is YouTube's own
     // translation of the same URL, so it costs nothing, and it is the last chance to get it: the
     // phone has no signed URL of its own.
