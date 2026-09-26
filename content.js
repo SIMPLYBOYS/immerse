@@ -139,28 +139,57 @@ function splitPhrases(text, phrases = []) {
 // carries the time its first word is spoken — cue start when it opens a cue, interpolated by
 // character position when it starts mid-cue. Called twice per track: with SENTENCE for the
 // card/explain context, with CLAUSE for A/S/D navigation and card timestamps.
-function toSentences(cues, re = SENTENCE) {
+// A run of auto-transcribed speech can go for many seconds without a full stop, and then the
+// whole run becomes one "sentence" — four or five clauses merged into an unreadable wall. Cap the
+// length: past this many characters with no period in sight, break at a natural point instead.
+const MAX_SENT = 180;
+
+function toSentences(cues, re = SENTENCE, max = MAX_SENT) {
   const out = [];
   let buf = "";
   let start = null;
+
+  // Push buf[0..cut) as a segment and advance `start` to the character position `cut` inside the
+  // current cue. A cue-granular start sits up to a whole cue early — inside the tail of the piece
+  // just pushed — so the previous piece's last words were attributed to the next one, and S
+  // (replay) kept landing on its own last word. Interpolate by character position; without a
+  // finite cue end, fall back to the cue start.
+  const emit = (cut, c) => {
+    out.push({ text: buf.slice(0, cut).trim(), start });
+    buf = buf.slice(cut);
+    if (!buf.trim()) {
+      start = null;
+      buf = "";
+      return;
+    }
+    const consumed = Math.max(0, c.text.length - buf.length);
+    const dur = Number.isFinite(c.end) ? c.end - c.start : 0;
+    start = c.start + (c.text.length && dur > 0 ? (dur * consumed) / c.text.length : 0);
+  };
+
   for (const c of cues) {
     if (start === null) start = c.start;
     buf = buf ? `${buf} ${c.text}` : c.text;
-    let m;
-    while ((m = buf.match(re))) {
-      out.push({ text: m[1].trim(), start });
-      buf = buf.slice(m[0].length);
-      if (!buf.trim()) {
-        // Nothing left over: the next sentence starts in whichever cue comes next.
-        start = null;
-      } else {
-        // The next sentence starts mid-cue. A cue-granular start sits up to a whole cue early —
-        // inside the tail of the sentence just pushed — so the previous sentence's last words
-        // were attributed to the next one, and S (replay) kept landing on its own last word.
-        // Interpolate by character position; without a finite cue end, fall back to cue start.
-        const consumed = Math.max(0, c.text.length - buf.length);
-        const dur = Number.isFinite(c.end) ? c.end - c.start : 0;
-        start = c.start + (c.text.length && dur > 0 ? (dur * consumed) / c.text.length : 0);
+    // Emit at the EARLIER of: a sentence end within the cap, or the cap itself. Checking the cap
+    // only after re has matched misses the real offender — a run with no INTERNAL period whose
+    // one full stop is 500 characters away: re happily swallows the lot before the cap is ever
+    // consulted. So when the matched sentence would itself exceed the cap, break at the cap first.
+    let progress = true;
+    while (progress) {
+      progress = false;
+      const m = buf.match(re);
+      if (m && m[1].length <= max) {
+        emit(m[0].length, c);
+        progress = true;
+      } else if (buf.length > max) {
+        // No end in reach: break at a clause (comma/semicolon/colon) in the back half of the
+        // window, else the last space, else a hard cut. cut+1 keeps a comma with its clause.
+        const win = buf.slice(0, max);
+        let cut = Math.max(win.lastIndexOf(","), win.lastIndexOf(";"), win.lastIndexOf(":"));
+        if (cut < max / 2) cut = win.lastIndexOf(" ");
+        if (cut < max / 2) cut = max - 1;
+        emit(cut + 1, c);
+        progress = true;
       }
     }
   }
@@ -449,11 +478,12 @@ function start_() {
     askOnce({
       type: "tx-save",
       tx: {
-        // Bumped when the shape OR the translation changes, so a stale transcript is rewritten
-        // next time the video is opened. v6 re-translates with a prompt that stops the model
-        // swapping adjacent short fragments; v5 was the first per-sentence translation; v4 shipped
-        // YouTube's cues raw; v1-v3 split them per sentence — see ZH_SYSTEM in prompts.js.
-        v: state.zh.length ? 6 : 4,
+        // Bumped when segmentation OR translation changes, so a stale transcript is rewritten
+        // next open. v7 caps over-long sentences (MAX_SENT) so a periodless run no longer merges
+        // several sentences, and re-translates because the boundaries — and so the zh alignment —
+        // moved; v6 tightened the translation prompt; v5 was the first per-sentence translation;
+        // v4 shipped YouTube's cues raw; v1-v3 split them per sentence — see prompts.js.
+        v: state.zh.length ? 7 : 4,
         videoId,
         title,
         at: Date.now(),
@@ -482,7 +512,7 @@ function start_() {
         console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
         toast("逐字稿已是最新版，手機已有 ✓");
       } else {
-        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 6 : 4}`);
+        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 7 : 4}`);
         toast("逐字稿已上傳，手機可以看了 ✓", 0);
       }
     });
@@ -516,7 +546,7 @@ function start_() {
   // the output ceiling; and a batch that fails leaves holes in 80 lines, not in all of them.
   // Cached per video like the others — about five cents of Haiku per talk, paid once.
   async function loadZh() {
-    const key = `zh2_${new URLSearchParams(location.search).get("v")}`;
+    const key = `zh3_${new URLSearchParams(location.search).get("v")}`;
     const full = state.sentences.map((s) => s.text).join(" ");
     const head = full.slice(0, 80);
     const hit = (await getStore(key))[key];

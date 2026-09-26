@@ -427,6 +427,25 @@ assert.deepEqual(parseZh(" 1 \t 乙 \n0\t", 2), ["", "乙"]);
 assert.deepEqual(parseZh("", 2), ["", ""]);
 assert.deepEqual(parseZh(undefined, 0), []);
 
+// --- toSentences caps an over-long run so it never becomes a 4-5 sentence wall ---
+{
+  // one 300-char clause-run with no period, split into cues of a few words each
+  const words = ("a, " + Array.from({ length: 60 }, (_, i) => "word" + i).join(" ") + ". end.").split(" ");
+  const cues = words.map((w, i) => ({ text: w, start: i, end: i + 1 }));
+  const segs = toSentences(cues);
+  // nothing exceeds the cap
+  assert.ok(segs.every((x) => x.text.length <= 180), "a segment exceeded MAX_SENT");
+  // every character is preserved, nothing dropped or duplicated
+  assert.equal(
+    segs.map((s) => s.text).join(" ").replace(/\s+/g, " ").trim(),
+    words.join(" ").replace(/\s+/g, " ").trim(),
+  );
+  // a normal short sentence is left as one piece
+  const short = toSentences([{ text: "Hello there.", start: 0, end: 1 }]);
+  assert.equal(short.length, 1);
+  assert.equal(short[0].text, "Hello there.");
+}
+
 // --- replayTarget: S replays the sentence the ear just heard ---
 const rp = [
   { start: 0, end: 10 },
