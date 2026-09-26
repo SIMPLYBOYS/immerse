@@ -59,12 +59,25 @@ function Stats({ deck }) {
 
   const peak = Math.max(1, ...view.series);
 
+  // Total accumulated immersion — every day on record, across every device, independent of the
+  // 7/30/90 range above (those only scope the chart and averages). deck.immLog is the folded
+  // per-day log, so summing it is the all-device total as of the last sync.
+  const totalSec = Object.values(deck.immLog ?? {}).reduce((a, b) => a + (Number(b) || 0), 0);
+  const totalH = Math.floor(totalSec / 3600);
+  const totalM = Math.floor((totalSec % 3600) / 60);
+  const totalLabel = totalH > 0 ? `${totalH} 小時 ${totalM} 分` : `${totalM} 分`;
+
   return (
     <ScrollView style={S.screen} contentContainerStyle={S.pad}>
       <Text style={S.h1}>數據分析</Text>
       <Text style={S.sub}>沉浸與複習的實際軌跡，資料由桌機與這台裝置共同累積。</Text>
 
-      <View style={{ flexDirection: "row", gap: 8, marginTop: 14, marginBottom: 14 }}>
+      <View style={[S.card, { marginTop: 14, alignItems: "center", paddingVertical: 18 }]}>
+        <Text style={[S.big, { fontSize: 34, color: C.blue }]}>{totalLabel}</Text>
+        <Text style={[S.sub, { fontSize: 12, marginTop: 4 }]}>累積沉浸總時數</Text>
+      </View>
+
+      <View style={{ flexDirection: "row", gap: 8, marginBottom: 14 }}>
         {RANGES.map(([d, label]) => (
           <Pressable
             key={d}
