@@ -275,6 +275,7 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
   const [want, setWant] = useState(true); // the request — autoplay on open
   const [playing, setPlaying] = useState(false); // the report — everything timed keys off this
   const [cur, setCur] = useState(-1); // the line being spoken, NOT the raw clock
+  const [spoken, setSpoken] = useState(-1); // the word within that line, derived from the SAME tick
   const [zhOn, setZhOn] = useState(false);
   const [follow, setFollow] = useState(true);
   const [sel, setSel] = useState(null);
@@ -357,26 +358,29 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
     [onImmersion, tx.videoId],
   );
 
-  // Twice a second keeps the highlight honest without interrogating the player constantly.
+  // ONE getCurrentTime caller for the whole screen. react-native-youtube-iframe resolves EVERY
+  // pending getCurrentTime promise with whichever page response lands first and drops the rest
+  // (eventEmitter.once + emit-to-all), so two concurrent pollers — this line clock and a separate
+  // per-word one — handed each other stale times, and the subtitle drifted further the longer the
+  // WebView had been janking (i.e. deeper into a video, and right after a seek). So the word index
+  // is derived from the SAME t as the line index, in this single loop.
   useEffect(() => {
     if (!playing) return;
     const iv = setInterval(async () => {
       try {
         const t = await player.current?.getCurrentTime();
         if (typeof t !== "number") return;
-        // Which line is being spoken — a lookup, not a guess, because every sentence carries a
-        // start and an end. Storing the raw clock instead re-rendered the entire transcript twice
-        // a second; with the Chinese lines switched on there was enough work in each pass for the
-        // list to visibly jitter. The index only changes once a line, so the list only redraws
-        // once a line.
+        // Which line is being spoken — a lookup, not a guess: every sentence carries a start and
+        // an end. The index only changes once a line, so the list only redraws once a line.
         const i = tx.sentences.findIndex((s) => t >= s.start && t < s.end);
         setCur((c) => (c === i ? c : i));
+        setSpoken(i >= 0 ? spokenIdx(lineTokens[i], tx.sentences[i], t) : -1);
       } catch {
         // not ready yet, or gone — the next tick will do
       }
-    }, 500);
+    }, 250);
     return () => clearInterval(iv);
-  }, [playing, tx.sentences]);
+  }, [playing, tx.sentences, lineTokens]);
 
   // Keep the spoken line on screen, unless the reader has taken the wheel by scrolling.
   const followTo = (index, animated) => {
@@ -414,6 +418,7 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
     if (perr) return openInYouTube(sec);
     player.current?.seekTo(Math.max(0, sec), true);
     setCur(tx.sentences.findIndex((s) => sec >= s.start && sec < s.end));
+    setSpoken(-1);
     setWant(true); // ask; the clock starts when the player says it started
   };
 
@@ -626,8 +631,7 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
                 lineIndex={index}
                 sentence={item}
                 on={index === cur}
-                player={player}
-                playing={playing}
+                spoken={index === cur ? spoken : -1}
                 pos={tx.pos ?? {}}
                 marks={marks}
                 range={sel?.range && sel.range.line === index ? sel.range : null}
@@ -686,31 +690,10 @@ function ZhBar({ zh, cur }) {
   );
 }
 
-function Line({ tokens, lineIndex, sentence, on, player, playing, pos, marks, range, onWordPress, onSeek }) {
-  const [spoken, setSpoken] = useState(-1);
-
-  // Only the line being spoken keeps a clock, and it holds the result itself — so a word lighting
-  // up four times a second redraws this one row instead of the whole transcript. That is the same
-  // reason the screen above tracks a line index rather than the raw seconds.
-  useEffect(() => {
-    if (!on) {
-      setSpoken(-1);
-      return;
-    }
-    if (!playing) return; // paused: leave the last word lit, so the eye keeps its place
-    const iv = setInterval(async () => {
-      try {
-        const t = await player.current?.getCurrentTime();
-        if (typeof t !== "number") return;
-        const n = spokenIdx(tokens, sentence, t);
-        setSpoken((c) => (c === n ? c : n));
-      } catch {
-        // not ready yet, or gone — the next tick will do
-      }
-    }, 250);
-    return () => clearInterval(iv);
-  }, [on, playing, tokens, sentence, player]);
-
+// `spoken` is the index of the word lit up now, computed once per tick by the screen's single
+// clock (see the note on that loop) and handed down — the per-line clock this used to keep was the
+// second concurrent getCurrentTime caller that made the subtitle drift.
+function Line({ tokens, lineIndex, sentence, on, spoken, pos, marks, range, onWordPress, onSeek }) {
   return (
     // Tapping anywhere that is not a word seeks the player to this line. The words keep their own
     // taps, so the gesture only lands here in the gaps — which is exactly where a reader aiming
