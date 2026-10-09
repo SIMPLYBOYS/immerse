@@ -479,11 +479,12 @@ function start_() {
       type: "tx-save",
       tx: {
         // Bumped when segmentation OR translation changes, so a stale transcript is rewritten
-        // next open. v7 caps over-long sentences (MAX_SENT) so a periodless run no longer merges
-        // several sentences, and re-translates because the boundaries — and so the zh alignment —
-        // moved; v6 tightened the translation prompt; v5 was the first per-sentence translation;
-        // v4 shipped YouTube's cues raw; v1-v3 split them per sentence — see prompts.js.
-        v: state.zh.length ? 7 : 4,
+        // next open. v8 translates COMPLETE sentences and maps each capped display line to the one
+        // it sits in — v7's mid-clause cap had created fragments the model mis-numbered, shifting
+        // the Chinese a sentence ahead; v7 added the length cap; v6 tightened the prompt; v5 was
+        // the first per-sentence translation; v4 shipped YouTube's cues raw; v1-v3 split per
+        // sentence — see prompts.js.
+        v: state.zh.length ? 8 : 4,
         videoId,
         title,
         at: Date.now(),
@@ -512,7 +513,7 @@ function start_() {
         console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
         toast("逐字稿已是最新版，手機已有 ✓");
       } else {
-        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 7 : 4}`);
+        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 8 : 4}`);
         toast("逐字稿已上傳，手機可以看了 ✓", 0);
       }
     });
@@ -546,16 +547,23 @@ function start_() {
   // the output ceiling; and a batch that fails leaves holes in 80 lines, not in all of them.
   // Cached per video like the others — about five cents of Haiku per talk, paid once.
   async function loadZh() {
-    const key = `zh3_${new URLSearchParams(location.search).get("v")}`;
-    const full = state.sentences.map((s) => s.text).join(" ");
+    // Translate COMPLETE sentences, not the capped display ones. MAX_SENT splits a long run mid-
+    // clause for readability, but "can manage and control that data" is a fragment the model
+    // cannot translate one-to-one on its own numbered line — it folds it into the neighbour and
+    // every later line shifts by one, so the Chinese ran a sentence ahead. Whole sentences the
+    // model aligns reliably; each capped display line then borrows the translation of the complete
+    // sentence it falls inside (by start time), so pieces of one thought share its translation.
+    const complete = toSentences(state.cues, SENTENCE, Infinity);
+    const key = `zh4_${new URLSearchParams(location.search).get("v")}`;
+    const full = complete.map((s) => s.text).join(" ");
     const head = full.slice(0, 80);
     const hit = (await getStore(key))[key];
     let raw = hit?.head === head ? hit.raw : undefined;
     if (raw === undefined) {
       const BATCH = 80;
       const parts = [];
-      for (let i = 0; i < state.sentences.length; i += BATCH) {
-        const text = state.sentences
+      for (let i = 0; i < complete.length; i += BATCH) {
+        const text = complete
           .slice(i, i + BATCH)
           .map((s, k) => `${i + k}\t${s.text}`)
           .join("\n");
@@ -565,10 +573,17 @@ function start_() {
       }
       raw = parts.join("\n");
     }
-    state.zh = parseZh(raw, state.sentences.length);
+    const zhComplete = parseZh(raw, complete.length);
+    // Each display sentence shows the translation of the complete sentence it begins inside.
+    state.zh = state.sentences.map((s) => {
+      let j = complete.findIndex((c) => s.start >= c.start && s.start < c.end);
+      if (j < 0) j = complete.length - 1;
+      return zhComplete[j] ?? "";
+    });
     const got = state.zh.filter(Boolean).length;
-    if (hit?.raw !== raw && got) setStore({ [key]: { raw, head } });
-    console.log("[immerse]", got, "/", state.sentences.length, "sentences translated");
+    if (hit?.raw !== raw && zhComplete.filter(Boolean).length) setStore({ [key]: { raw, head } });
+    console.log("[immerse]", got, "/", state.sentences.length, "display lines (",
+      complete.length, "complete sentences) translated");
     repaint();
   }
 

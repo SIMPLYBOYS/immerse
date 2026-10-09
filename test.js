@@ -1,6 +1,6 @@
 const assert = require("assert");
 const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, parseZh, replayTarget, cueUrl,
-  CLAUSE } = require("./content.js");
+  CLAUSE, SENTENCE } = require("./content.js");
 
 // --- parseReply ---
 const reply = parseReply(`CONTEXT: "Grew into" means developed into something larger.
@@ -444,6 +444,24 @@ assert.deepEqual(parseZh(undefined, 0), []);
   const short = toSentences([{ text: "Hello there.", start: 0, end: 1 }]);
   assert.equal(short.length, 1);
   assert.equal(short[0].text, "Hello there.");
+}
+
+// --- translation maps each capped display line to the complete sentence it sits in ---
+// A long run with no period becomes ONE complete sentence but SEVERAL capped display lines; the
+// zh for every one of those lines must be the complete sentence's translation, not drift.
+{
+  const words = (Array.from({ length: 60 }, (_, i) => "w" + i).join(" ") + ". Short one.").split(" ");
+  const cues = words.map((w, i) => ({ text: w, start: i, end: i + 1 }));
+  const capped = toSentences(cues, SENTENCE, 120);          // display: run is split
+  const complete = toSentences(cues, SENTENCE, Infinity);   // translation: run stays whole
+  assert.ok(capped.length > complete.length, "cap should split the run into more pieces");
+  // every capped line maps to exactly one complete sentence by start time
+  const map = capped.map((s) => complete.findIndex((c) => s.start >= c.start && s.start < c.end));
+  assert.ok(map.every((j) => j >= 0), "every display line maps to a complete sentence");
+  // the fragments of the long run all point at the SAME complete sentence (index 0)
+  assert.ok(map.filter((j) => j === 0).length >= 2, "run fragments share one complete sentence");
+  // monotonic: later display lines never map to an earlier complete sentence
+  for (let i = 1; i < map.length; i++) assert.ok(map[i] >= map[i - 1]);
 }
 
 // --- replayTarget: S replays the sentence the ear just heard ---
