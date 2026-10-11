@@ -508,13 +508,25 @@ function start_() {
         toast(`逐字稿上傳失敗：${r.error}`, 0);
       } else if (r?.skipped) {
         // Not silent any more: replaying a video and seeing NOTHING read as "the upload isn't
-        // working". A brief auto-fading line (not the sticky bubble) confirms the desktop checked
-        // and the phone already has this one, without nagging on every open.
-        console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
-        toast("逐字稿已是最新版，手機已有 ✓");
+        // working". A brief line confirms the desktop checked and the phone already has this one.
+        // But a skipped v4 is still a transcript WITHOUT translation — say so, and make it sticky,
+        // because "已是最新 ✓" would wrongly imply it is complete.
+        if ((r.v ?? 0) < 5) {
+          console.warn("[immerse] 已是最新但「沒有中文翻譯」(v4)", videoId, "— 翻譯仍失敗，稍後 API 正常時再重播");
+          toast("這支已上傳但仍沒有中文翻譯 ⚠️ 翻譯這次又失敗，稍後再於桌機重新播放補上", 0);
+        } else {
+          console.log("[immerse] 逐字稿已是最新", videoId, `v${r.v ?? "?"}`);
+          toast("逐字稿已是最新版，含中文翻譯，手機已有 ✓");
+        }
+      } else if (state.zh.length) {
+        console.log("[immerse] 逐字稿已存入雲端", videoId, "v8（含中文翻譯）");
+        toast("逐字稿已上傳，含中文翻譯，手機可以看了 ✓", 0);
       } else {
-        console.log("[immerse] 逐字稿已存入雲端", videoId, `v${state.zh.length ? 8 : 4}`);
-        toast("逐字稿已上傳，手機可以看了 ✓", 0);
+        // v4: the transcript is up and usable for reading/immersion, but translation failed, so
+        // there is no Chinese. Say so plainly — the old toast claimed success for a half-upload —
+        // and name the fix: replaying the video re-runs the translation and upgrades it to v8.
+        console.warn("[immerse] 逐字稿已上傳但「沒有中文翻譯」(v4)", videoId, "— 翻譯失敗，請重新播放此影片以補上");
+        toast("逐字稿已上傳，但這次沒有中文翻譯 ⚠️ 請在桌機重新播放此影片以補上翻譯", 0);
       }
     });
   }
