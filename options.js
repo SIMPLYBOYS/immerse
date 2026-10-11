@@ -115,7 +115,10 @@ function wire() {
   // Whitespace anywhere, not just at the ends: a credential copied out of a wrapped line carries
   // a newline in its middle, which trim() leaves in place and the HTTP layer later rejects with
   // "Unexpected char 0x0d in authorization value" — a failure that reads like a bad token.
-  const clean = (x) => String(x ?? "").replace(/\s+/g, "");
+  // Strip not just spaces but every invisible character that survives a copy from a web page —
+  // zero-width spaces, word joiners, soft hyphens, control chars — any of which makes a key the
+  // last-4 still looks right but Anthropic/GitHub reject as "invalid". \s misses the zero-width ones.
+  const clean = (x) => String(x ?? "").replace(/[\s\u0000-\u001F\u007F-\u009F­​‌‍⁠﻿]/g, "");
   document.getElementById("gh").addEventListener("submit", async (e) => {
     e.preventDefault();
     const patch = {};

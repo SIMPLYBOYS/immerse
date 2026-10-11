@@ -17,7 +17,10 @@ const get = (k) => SecureStore.getItemAsync(k).catch(() => null);
 // authorization value", which reads like a server rejection and is not one. None of these values
 // may contain whitespace at all, so remove every last bit of it — on the way in and on the way
 // out, so a value already stored broken repairs itself without being re-typed.
-const clean = (s) => String(s ?? "").replace(/\s+/g, "");
+// Strip not just spaces but every invisible character that survives a paste — zero-width spaces,
+// word joiners, soft hyphens, control chars — any of which makes a key whose last 4 look right but
+// the server rejects as invalid. \s alone misses the zero-width ones.
+const clean = (s) => String(s ?? "").replace(/[\s\u0000-\u001F\u007F-\u009F\u00AD\u200B\u200C\u200D\u2060\uFEFF]/g, "");
 
 // No crypto.randomUUID: Hermes does not reliably ship it. Eight base-36 characters is ~2.8
 // trillion possibilities, against a population of "this person's phones".

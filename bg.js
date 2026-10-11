@@ -5,6 +5,12 @@ importScripts("merge.js", "prompts.js"); // kept separate so node — and the ph
 
 globalThis.setKey = (apiKey) => chrome.storage.local.set({ apiKey });
 
+// Credentials get cleaned on SAVE (options page), but also on READ here: a key already stored
+// with an invisible character — a zero-width space or word joiner pasted from a web page, which
+// \s does not match — would otherwise keep being sent and rejected as "invalid x-api-key" until
+// re-typed. Cleaning on use repairs it without the user touching anything.
+const clean = (x) => String(x ?? "").replace(/[\s\u0000-\u001F\u007F-\u009F\u00AD\u200B\u200C\u200D\u2060\uFEFF]/g, "");
+
 // Toolbar icon opens the review page — the one screen that isn't tied to a video.
 chrome.action.onClicked.addListener(() =>
   chrome.tabs.create({ url: chrome.runtime.getURL("review.html") }),
@@ -193,7 +199,8 @@ async function deviceId() {
 }
 
 const ghCfg = async () => {
-  const { ghToken, ghRepo } = await chrome.storage.local.get(["ghToken", "ghRepo"]);
+  const r = await chrome.storage.local.get(["ghToken", "ghRepo"]);
+  const ghToken = clean(r.ghToken), ghRepo = clean(r.ghRepo);
   if (!ghToken || !ghRepo) throw new Error("先在選項頁填 GitHub repo 與 token");
   return { ghToken, ghRepo };
 };
@@ -464,7 +471,7 @@ async function meter(kind, usage) {
 }
 
 async function claude(system, user, maxTokens, kind) {
-  const { apiKey } = await chrome.storage.local.get("apiKey");
+  const apiKey = clean((await chrome.storage.local.get("apiKey")).apiKey);
   if (!apiKey) throw new Error("no API key — set one in the extension options");
   // MV3 idle-kills this worker after ~30s without extension-API activity, and awaiting a fetch
   // does not count as activity. A long generation — pos tags a whole transcript — can outlive
