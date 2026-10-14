@@ -81,6 +81,15 @@ push part of this line onto the next. For example, given "14\tandrew ng on a cou
 translate "it looks like that's the case" — not the reverse. Use neighbouring lines only to \
 understand meaning, never as a place to relocate words.
 
+Some lines contain the marker ⟦|⟧. It marks where the English is broken into pieces that are shown \
+on screen one at a time, beside their own Chinese. For such a line, return the translation in the \
+SAME number of pieces, separated by the same marker ⟦|⟧, each piece translating the English piece in \
+the same position. Chinese word order differs, so rearrange freely WITHIN the sentence to make each \
+piece carry the meaning of its own English piece and read naturally on its own — for example, \
+"7\tI'll show you how I design agents, from loops, models, tools, memory ⟦|⟧ and production \
+controls." becomes "7\t我會示範我如何設計代理，涵蓋循環、模型、工具、記憶 ⟦|⟧ 以及生產環境的控制。". \
+Never drop or add a marker.
+
 The text is auto-transcribed speech: names and technical terms are often mis-heard, so render what \
 was most likely said. Keep product names, code identifiers and established technical terms in \
 English where a Chinese-speaking engineer would.

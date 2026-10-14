@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, parseZh, replayTarget, cueUrl,
+const { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor, spokenIdx, parseZh, replayTarget, groupDisplay, zhForGroups, cueUrl,
   CLAUSE, SENTENCE } = require("./content.js");
 
 // --- parseReply ---
@@ -462,6 +462,25 @@ assert.deepEqual(parseZh(undefined, 0), []);
   assert.ok(map.filter((j) => j === 0).length >= 2, "run fragments share one complete sentence");
   // monotonic: later display lines never map to an earlier complete sentence
   for (let i = 1; i < map.length; i++) assert.ok(map[i] >= map[i - 1]);
+}
+
+// --- zhForGroups: a capped sentence's translation lands piece by piece ---
+{
+  const complete = [{ start: 0, end: 10 }, { start: 10, end: 20 }];
+  const display = [{ start: 0, end: 6 }, { start: 6, end: 10 }, { start: 10, end: 20 }];
+  const groups = groupDisplay(display, complete);
+  assert.deepEqual(groups, [[0, 1], [2]]);
+  // the model returned one piece per English piece: each display line gets its own
+  assert.deepEqual(zhForGroups(groups, ["我會示範設計代理 ⟦|⟧ 以及生產控制。", "第二句。"], 3),
+    ["我會示範設計代理", "以及生產控制。", "第二句。"]);
+  // marker count came back wrong: whole translation on every piece (never misaligned), markers gone
+  assert.deepEqual(zhForGroups(groups, ["整句一起回來了。", "第二句。"], 3),
+    ["整句一起回來了。", "整句一起回來了。", "第二句。"]);
+  assert.deepEqual(zhForGroups(groups, ["一 ⟦|⟧ 二 ⟦|⟧ 三", "x"], 3), ["一二三", "一二三", "x"]);
+  // an empty piece is not a valid split either
+  assert.deepEqual(zhForGroups(groups, ["一 ⟦|⟧ ", "x"], 3), ["一", "一", "x"]);
+  // missing translation stays blank
+  assert.deepEqual(zhForGroups(groups, ["", "x"], 3), ["", "", "x"]);
 }
 
 // --- replayTarget: S replays the sentence the ear just heard ---

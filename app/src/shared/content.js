@@ -251,6 +251,43 @@ function parseZh(raw, n) {
   return out;
 }
 
+// The pieces a capped display line was cut into, grouped under the complete sentence they belong
+// to. Translation runs on complete sentences (the model aligns those one-to-one); this says which
+// display lines each complete sentence has to be shown across. By start time: every display line
+// starts inside exactly one complete sentence, since both come from the same cues.
+function groupDisplay(display, complete) {
+  const groups = complete.map(() => []);
+  display.forEach((d, i) => {
+    let j = complete.findIndex((c) => d.start >= c.start && d.start < c.end);
+    if (j < 0) j = complete.length - 1;
+    groups[j].push(i);
+  });
+  return groups;
+}
+
+const ZH_MARK = "⟦|⟧";
+
+// A complete sentence's translation back onto its display pieces. The model was asked to return
+// one Chinese piece per English piece, rearranged so each carries its own piece's meaning — word
+// order differs, so splitting by proportion (tried, v1-v3) put the wrong Chinese under the wrong
+// English. If the piece count came back wrong, the whole translation goes on every piece: correct
+// meaning, just not divided, which is what v8 showed everywhere.
+function zhForGroups(groups, zhComplete, n) {
+  const out = Array.from({ length: n }, () => "");
+  groups.forEach((idx, j) => {
+    const zh = String(zhComplete[j] ?? "");
+    if (!idx.length) return;
+    const pieces = zh.split(/\s*⟦\|⟧\s*/).map((x) => x.trim());
+    if (idx.length > 1 && pieces.length === idx.length && pieces.every(Boolean)) {
+      idx.forEach((i, k) => (out[i] = pieces[k]));
+    } else {
+      const whole = pieces.filter(Boolean).join("");
+      idx.forEach((i) => (out[i] = whole));
+    }
+  });
+  return out;
+}
+
 // Which sentence S should replay. Not simply "the one the clock is in": sentence ends and
 // starts touch, so by the time a hand reacts to a sentence landing and presses S, the clock has
 // usually crossed into the next one — replaying THAT replays a sentence barely begun. So less
@@ -479,12 +516,12 @@ function start_() {
       type: "tx-save",
       tx: {
         // Bumped when segmentation OR translation changes, so a stale transcript is rewritten
-        // next open. v8 translates COMPLETE sentences and maps each capped display line to the one
+        // next open. v9 has the model split a capped sentence's translation piece-by-piece. v8 translates COMPLETE sentences and maps each capped display line to the one
         // it sits in — v7's mid-clause cap had created fragments the model mis-numbered, shifting
         // the Chinese a sentence ahead; v7 added the length cap; v6 tightened the prompt; v5 was
         // the first per-sentence translation; v4 shipped YouTube's cues raw; v1-v3 split per
         // sentence — see prompts.js.
-        v: state.zh.length ? 8 : 4,
+        v: state.zh.length ? 9 : 4,
         videoId,
         title,
         at: Date.now(),
@@ -519,7 +556,7 @@ function start_() {
           toast("逐字稿已是最新版，含中文翻譯，手機已有 ✓");
         }
       } else if (state.zh.length) {
-        console.log("[immerse] 逐字稿已存入雲端", videoId, "v8（含中文翻譯）");
+        console.log("[immerse] 逐字稿已存入雲端", videoId, "v9（含中文翻譯）");
         toast("逐字稿已上傳，含中文翻譯，手機可以看了 ✓", 0);
       } else {
         // v4: the transcript is up and usable for reading/immersion, but translation failed, so
@@ -559,25 +596,27 @@ function start_() {
   // the output ceiling; and a batch that fails leaves holes in 80 lines, not in all of them.
   // Cached per video like the others — about five cents of Haiku per talk, paid once.
   async function loadZh() {
-    // Translate COMPLETE sentences, not the capped display ones. MAX_SENT splits a long run mid-
-    // clause for readability, but "can manage and control that data" is a fragment the model
-    // cannot translate one-to-one on its own numbered line — it folds it into the neighbour and
-    // every later line shifts by one, so the Chinese ran a sentence ahead. Whole sentences the
-    // model aligns reliably; each capped display line then borrows the translation of the complete
-    // sentence it falls inside (by start time), so pieces of one thought share its translation.
+    // Translate COMPLETE sentences — the model aligns those one-to-one, where capped mid-clause
+    // fragments made its numbering drift and the Chinese ran a sentence ahead (v7). But a complete
+    // sentence's translation shown whole beside each of its small display pieces read as one big
+    // Chinese block under a short English tail (v8). So a sentence the cap split goes out with
+    // ⟦|⟧ at the cuts, and the model returns one Chinese piece per English piece (zhForGroups).
     const complete = toSentences(state.cues, SENTENCE, Infinity);
-    const key = `zh4_${new URLSearchParams(location.search).get("v")}`;
-    const full = complete.map((s) => s.text).join(" ");
-    const head = full.slice(0, 80);
+    const groups = groupDisplay(state.sentences, complete);
+    const lines = complete.map((c, j) =>
+      groups[j].length > 1 ? groups[j].map((i) => state.sentences[i].text).join(` ${ZH_MARK} `) : c.text,
+    );
+    const key = `zh5_${new URLSearchParams(location.search).get("v")}`;
+    const head = lines.join(" ").slice(0, 80);
     const hit = (await getStore(key))[key];
     let raw = hit?.head === head ? hit.raw : undefined;
     if (raw === undefined) {
       const BATCH = 80;
       const parts = [];
-      for (let i = 0; i < complete.length; i += BATCH) {
-        const text = complete
+      for (let i = 0; i < lines.length; i += BATCH) {
+        const text = lines
           .slice(i, i + BATCH)
-          .map((s, k) => `${i + k}\t${s.text}`)
+          .map((t, k) => `${i + k}\t${t}`)
           .join("\n");
         const res = await ask({ type: "zh", text });
         if (!res || res.error) return console.warn("[immerse] zh failed:", res?.error ?? "no reply");
@@ -586,16 +625,11 @@ function start_() {
       raw = parts.join("\n");
     }
     const zhComplete = parseZh(raw, complete.length);
-    // Each display sentence shows the translation of the complete sentence it begins inside.
-    state.zh = state.sentences.map((s) => {
-      let j = complete.findIndex((c) => s.start >= c.start && s.start < c.end);
-      if (j < 0) j = complete.length - 1;
-      return zhComplete[j] ?? "";
-    });
+    state.zh = zhForGroups(groups, zhComplete, state.sentences.length);
     const got = state.zh.filter(Boolean).length;
     if (hit?.raw !== raw && zhComplete.filter(Boolean).length) setStore({ [key]: { raw, head } });
-    console.log("[immerse]", got, "/", state.sentences.length, "display lines (",
-      complete.length, "complete sentences) translated");
+    console.log("[immerse]", got, "/", state.sentences.length, "display lines translated (",
+      complete.length, "complete sentences)");
     repaint();
   }
 
@@ -1294,4 +1328,4 @@ function start_() {
 if (typeof document !== "undefined") start_();
 if (typeof module !== "undefined")
   module.exports = { toSentences, splitPhrases, posOf, parseReply, markRate, zhFor,
-    spokenIdx, parseZh, replayTarget, cueUrl, CLAUSE, WORD };
+    spokenIdx, parseZh, replayTarget, groupDisplay, zhForGroups, cueUrl, CLAUSE, SENTENCE, WORD };
