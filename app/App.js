@@ -99,7 +99,11 @@ export default function App() {
     try {
       // words and log only. `marks` is derived from the rows when folding, and the counters this
       // device does not produce must stay out of its file or the fold would count them twice.
-      const next = await push(c.repo, c.token, c.deviceId, { words: d.words, log, ...imm }, sha);
+      // shadows are rows like words — whole and idempotent, merged by id — so the folded list
+      // goes up as-is; only the counters must be this device's own.
+      const next = await push(
+        c.repo, c.token, c.deviceId, { words: d.words, shadows: d.shadows ?? [], log, ...imm }, sha,
+      );
       setOwnSha(next);
       return true;
     } catch (e) {
@@ -167,6 +171,13 @@ export default function App() {
 
   const applyRow = (row) => {
     setDeck((d) => ({ ...d, words: d.words.map((w) => (w.id === row.id ? row : w)) }));
+    markDirty();
+  };
+
+  // One 跟讀 attempt. Rows, not a counter: the missed-word list and the longest-reproduction
+  // trend both need each attempt, and a daily total can always be summed back out of them.
+  const addShadow = (row) => {
+    setDeck((d) => ({ ...d, shadows: [...(d.shadows ?? []), row] }));
     markDirty();
   };
 
@@ -320,6 +331,7 @@ export default function App() {
           marks={deck.marks}
           onMark={markWord}
           onImmersion={addImmersion}
+          onShadow={addShadow}
           todaySec={todaySec()}
         />
       );

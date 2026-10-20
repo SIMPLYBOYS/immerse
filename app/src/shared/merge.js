@@ -14,6 +14,7 @@
 // beats two that can drift apart.
 function foldSnapshots(snaps) {
   const rows = new Map();
+  const shadows = new Map(); // 跟讀 attempts: written once, never edited, so the id alone merges them
   const deleted = {};
   const counters = { log: {}, immLog: {}, immByVideo: {} };
   let immersion = 0;
@@ -28,6 +29,7 @@ function foldSnapshots(snaps) {
       const cur = rows.get(w.id);
       if (!cur || (w.updatedAt ?? 0) > (cur.updatedAt ?? 0)) rows.set(w.id, w);
     }
+    for (const r of s.shadows ?? []) if (r?.id && !shadows.has(r.id)) shadows.set(r.id, r);
     for (const k of ["log", "immLog", "immByVideo"]) {
       for (const [key, n] of Object.entries(s[k] ?? {})) {
         counters[k][key] = (counters[k][key] ?? 0) + (Number(n) || 0);
@@ -41,7 +43,7 @@ function foldSnapshots(snaps) {
   // NEWER than the deletion revives the word, which is exactly what re-marking it in a video means.
   const words = [...rows.values()].filter((w) => (deleted[w.id] ?? 0) <= (w.updatedAt ?? 0));
   const marks = Object.fromEntries(words.map((w) => [w.id, w.suspended ? "known" : "learning"]));
-  return { words, marks, ...counters, immersion, deleted };
+  return { words, marks, ...counters, immersion, deleted, shadows: [...shadows.values()] };
 }
 
 // Counter arithmetic, kept here beside the fold that makes it necessary.

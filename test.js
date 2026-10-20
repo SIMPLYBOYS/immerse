@@ -483,6 +483,42 @@ assert.deepEqual(parseZh(undefined, 0), []);
   assert.deepEqual(zhForGroups(groups, ["", "x"], 3), ["", "", "x"]);
 }
 
+// --- shadowing (跟讀): chunks, attempt rows, stats, and the fold that syncs them ---
+{
+  const { chunkOf, shadowRow, shadowStats } = require("./app/src/shadow.js");
+  const sents = [{ start: 0, end: 4 }, { start: 4, end: 9 }, { start: 9, end: 12 }];
+  assert.deepEqual(chunkOf(sents, 0, 1), { i: 0, n: 1, start: 0, end: 4 });
+  assert.deepEqual(chunkOf(sents, 0, 2), { i: 0, n: 2, start: 0, end: 9 }); // 合併下一句
+  assert.deepEqual(chunkOf(sents, 2, 5), { i: 2, n: 1, start: 9, end: 12 }); // clamped at the end
+  assert.deepEqual(chunkOf(sents, -3, 0), { i: 0, n: 1, start: 0, end: 4 });
+
+  const r = shadowRow({ videoId: "v", i: 1, n: 1, words: 6, missed: [], sec: 7.6, now: 1000 });
+  assert.equal(r.full, true);
+  assert.equal(r.sec, 8);
+  assert.ok(r.id && r.at === 1000);
+  assert.equal(shadowRow({ videoId: "v", i: 0, n: 1, words: 6, missed: ["the"], sec: 1 }).full, false);
+
+  const day = (t) => (t < 100 ? "d1" : "d2");
+  const rows = [
+    { at: 10, words: 9, full: true, missed: [], sec: 20 },
+    { at: 200, words: 14, full: false, missed: ["Would", "have"], sec: 30 },
+    { at: 300, words: 12, full: true, missed: [], sec: 25 },
+    { at: 400, words: 5, full: false, missed: ["would"], sec: 10 },
+  ];
+  const st = shadowStats(rows, 500, day);
+  assert.equal(st.today, 3);
+  assert.equal(st.total, 4);
+  assert.equal(st.sec, 85);
+  assert.equal(st.best, 12); // the 14-word attempt missed words, so it does not count
+  assert.deepEqual(st.missedTop, [{ word: "would", count: 2 }, { word: "have", count: 1 }]);
+  assert.deepEqual(shadowStats(undefined, 0, day), { today: 0, total: 0, sec: 0, best: 0, missedTop: [] });
+
+  // Every device pushes the folded list back; the fold must not duplicate an attempt.
+  const a = { id: "x1", at: 1 }, b = { id: "x2", at: 2 };
+  const folded = foldSnapshots([{ shadows: [a] }, { shadows: [a, b] }, {}]);
+  assert.deepEqual(folded.shadows.map((x) => x.id).sort(), ["x1", "x2"]);
+}
+
 // --- replayTarget: S replays the sentence the ear just heard ---
 const rp = [
   { start: 0, end: 10 },

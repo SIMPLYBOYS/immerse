@@ -14,6 +14,7 @@ const {
   heatLevel,
   HEAT,
 } = require("../logic");
+const { shadowStats } = require("../shadow");
 
 const RANGES = [
   [7, "本週"],
@@ -67,6 +68,10 @@ function Stats({ deck }) {
   const totalM = Math.floor((totalSec % 3600) / 60);
   const totalLabel = totalH > 0 ? `${totalH} 小時 ${totalM} 分` : `${totalM} 分`;
 
+  // 跟讀, from the per-attempt rows. All-time like the total above, not scoped to the range.
+  const sh = shadowStats(deck.shadows, now, dayKey);
+  const shMin = Math.round(sh.sec / 60);
+
   return (
     <ScrollView style={S.screen} contentContainerStyle={S.pad}>
       <Text style={S.h1}>數據分析</Text>
@@ -75,6 +80,37 @@ function Stats({ deck }) {
       <View style={[S.card, { marginTop: 14, alignItems: "center", paddingVertical: 18 }]}>
         <Text style={[S.big, { fontSize: 34, color: C.blue }]}>{totalLabel}</Text>
         <Text style={[S.sub, { fontSize: 12, marginTop: 4 }]}>累積沉浸總時數</Text>
+      </View>
+
+      <View style={S.card}>
+        <Text style={S.label}>🎙 跟讀</Text>
+        {sh.total === 0 ? (
+          <Text style={[S.sub, { marginTop: 8 }]}>還沒有跟讀紀錄。在沉浸頁按「🎙 跟讀」開始。</Text>
+        ) : (
+          <>
+            <View style={{ flexDirection: "row", gap: 10, marginTop: 10 }}>
+              <Stat label="今日句數" value={sh.today} />
+              <Stat label="累計句數" value={sh.total} />
+              <Stat label="跟讀分鐘" value={shMin} />
+              <Stat label="最長完整重現(字)" value={sh.best} />
+            </View>
+            {sh.missedTop.length > 0 && (
+              <>
+                <Text style={[S.sub, { fontSize: 11, marginTop: 10 }]}>最常說不出來的字</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                  {sh.missedTop.map((m) => (
+                    <Text
+                      key={m.word}
+                      style={{ fontSize: 12, color: "#c0392b", backgroundColor: "#fde2e2", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}
+                    >
+                      {m.word} ×{m.count}
+                    </Text>
+                  ))}
+                </View>
+              </>
+            )}
+          </>
+        )}
       </View>
 
       <View style={{ flexDirection: "row", gap: 8, marginBottom: 14 }}>

@@ -22,6 +22,7 @@ const { listTx, getTx } = require("../cloud");
 const { loadHidden, hideVideo, unhideVideo, loadSplit, saveSplit } = require("../store");
 const { VERSION } = require("../shared/version");
 const { explain } = require("../ai");
+const { chunkOf, shadowRow } = require("../shadow");
 
 // Watching, not just reading. The video plays, the line being spoken lights up and scrolls
 // itself, tapping a line jumps the player there, tapping a word explains it in that context.
@@ -63,7 +64,7 @@ const mins = (sec) => {
   return m >= 60 ? `${Math.floor(m / 60)} 時 ${m % 60} 分` : `${m} 分`;
 };
 
-function Immerse({ cfg, syncTick, marks, onMark, onImmersion, todaySec }) {
+function Immerse({ cfg, syncTick, marks, onMark, onImmersion, onShadow, todaySec }) {
   const [index, setIndex] = useState({});
   const [input, setInput] = useState("");
   const [err, setErr] = useState(null);
@@ -133,6 +134,7 @@ function Immerse({ cfg, syncTick, marks, onMark, onImmersion, todaySec }) {
         marks={marks}
         onMark={onMark}
         onImmersion={onImmersion}
+        onShadow={onShadow}
         todaySec={todaySec}
         onBack={() => setTx(null)}
       />
@@ -267,7 +269,7 @@ true;
 const SPLIT = 0.6;
 const clampSplit = (r) => Math.min(0.78, Math.max(0.3, r));
 
-function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
+function Watch({ tx, cfg, marks, onMark, onImmersion, onShadow, todaySec, onBack }) {
   // What the player was asked to do and what it is actually doing are two different facts, and
   // one flag standing for both is what let the immersion clock bank seconds for a video nobody
   // was watching: mobile browsers routinely refuse autoplay, and when they do the video sits
@@ -282,6 +284,18 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
   const [perr, setPerr] = useState(null);
   const player = useRef(null);
   const list = useRef(null);
+
+  // 跟讀 (advanced shadowing). null when off; otherwise the chunk being practised and where in
+  // the loop it is: "play" (listening), "recall" (paused — say it from memory, text hidden),
+  // "reveal" (checking — tap the words that did not come out).
+  const [shadow, setShadow] = useState(null);
+  const [shadowDone, setShadowDone] = useState({ n: 0, best: 0 }); // this sitting only
+  const shadowRef = useRef(null);
+  shadowRef.current = shadow;
+  // Set once the clock has been seen INSIDE the chunk. A seek is not instant: the first tick
+  // after replaying can still report the old position past the chunk's end, which would pause
+  // the replay before it started.
+  const shadowSeen = useRef(false);
 
   // Turned sideways the screen is short and wide, so stacking the player above the transcript
   // would leave a couple of lines visible under it. Side by side, the video gets a column and the
@@ -375,6 +389,17 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
         const i = tx.sentences.findIndex((s) => t >= s.start && t < s.end);
         setCur((c) => (c === i ? c : i));
         setSpoken(i >= 0 ? spokenIdx(lineTokens[i], tx.sentences[i], t) : -1);
+        // 跟讀: stop at the end of the chunk so the reader can say it back. Same loop, same t —
+        // a second getCurrentTime caller is what made the subtitle drift once already.
+        const sh = shadowRef.current;
+        if (sh?.phase === "play") {
+          if (t < sh.end) shadowSeen.current = true;
+          else if (shadowSeen.current && t >= sh.end + SHADOW_TAIL) {
+            shadowSeen.current = false;
+            setWant(false);
+            setShadow((c) => (c && c.phase === "play" ? { ...c, phase: "recall" } : c));
+          }
+        }
       } catch {
         // not ready yet, or gone — the next tick will do
       }
@@ -478,6 +503,57 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
   // losing the thread of both. Same rule as the desktop's freeze/thaw: remember whether the pause
   // was ours, and on close resume only then, so a video the reader paused themselves stays put.
   const pausedByUs = useRef(false);
+
+  // --- 跟讀 actions ---
+  const shadowPlay = (sh) => {
+    shadowSeen.current = false;
+    player.current?.seekTo(Math.max(0, sh.start - SHADOW_LEAD), true);
+    setWant(true);
+  };
+  // keepT0: merging the next sentence is the same attempt growing, so its clock keeps running.
+  const startShadow = (i, n = 1, keepT0) => {
+    const sh = { ...chunkOf(tx.sentences, i, n), phase: "play", missed: {}, t0: keepT0 ?? Date.now() };
+    setShadow(sh);
+    shadowPlay(sh);
+  };
+  const toggleShadow = () => {
+    if (shadow) {
+      setShadow(null);
+      setWant(false);
+      return;
+    }
+    setSel(null);
+    startShadow(Math.max(0, cur));
+  };
+  const shadowWords = (sh) => {
+    const out = [];
+    for (let line = sh.i; line < sh.i + sh.n; line++) {
+      for (const tk of lineTokens[line] ?? []) {
+        if (tk.t === "w") out.push({ key: `${line}:${tk.idx}`, word: tk.word });
+      }
+    }
+    return out;
+  };
+  const recordShadow = (full) => {
+    const words = shadowWords(shadow);
+    const missed = full ? [] : words.filter((w) => shadow.missed[w.key]).map((w) => w.word);
+    // A phrase token is one tap target but several words; length is counted in words.
+    const len = words.reduce((a, w) => a + w.word.split(/\s+/).length, 0);
+    onShadow?.(
+      shadowRow({
+        videoId: tx.videoId, i: shadow.i, n: shadow.n, words: len, missed,
+        sec: (Date.now() - shadow.t0) / 1000,
+      }),
+    );
+    setShadowDone((d) => ({ n: d.n + 1, best: missed.length ? d.best : Math.max(d.best, len) }));
+    const next = shadow.i + shadow.n;
+    if (next >= tx.sentences.length) {
+      setShadow(null);
+      setWant(false);
+      return;
+    }
+    startShadow(next);
+  };
   const onWordPress = (line, idx, word) => {
     const s = tx.sentences[line];
     if (playing) {
@@ -536,6 +612,20 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
             }}
           />
           <Text style={[S.sub, { fontSize: 12, marginRight: 8 }]}>今日 {mmss(todaySec + banked)}</Text>
+          {!perr && (
+            <Pressable
+              onPress={toggleShadow}
+              hitSlop={8}
+              style={{
+                paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999, marginRight: 6,
+                backgroundColor: shadow ? C.blue : "transparent", borderWidth: 1, borderColor: C.blue,
+              }}
+            >
+              <Text style={{ fontSize: 12, color: shadow ? "#fff" : C.blue }}>
+                {shadow ? "結束跟讀" : "🎙 跟讀"}
+              </Text>
+            </Pressable>
+          )}
           <Text style={[S.sub, { fontSize: 12 }]}>跟隨</Text>
           <Switch value={follow} onValueChange={setFollow} />
           <Text style={[S.sub, { fontSize: 12, marginLeft: 8 }]}>中文</Text>
@@ -641,7 +731,31 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
             )}
           />
 
-          {zhOn && !perr && <ZhBar zh={tx.zh} cur={cur} />}
+          {!shadow && zhOn && !perr && <ZhBar zh={tx.zh} cur={cur} />}
+          {shadow && (
+            <ShadowPanel
+              shadow={shadow}
+              words={shadowWords(shadow)}
+              zh={(tx.zh ?? []).slice(shadow.i, shadow.i + shadow.n).filter(Boolean).join("")}
+              done={shadowDone}
+              last={shadow.i + shadow.n >= tx.sentences.length}
+              onReplay={() => {
+                setShadow((c) => ({ ...c, phase: "play" }));
+                shadowPlay(shadow);
+              }}
+              onReveal={() => {
+                setWant(false);
+                setShadow((c) => ({ ...c, phase: "reveal" }));
+              }}
+              onToggle={(key) =>
+                setShadow((c) => ({ ...c, missed: { ...c.missed, [key]: !c.missed[key] } }))
+              }
+              onFull={() => recordShadow(true)}
+              onRecord={() => recordShadow(false)}
+              onMerge={() => startShadow(shadow.i, shadow.n + 1, shadow.t0)}
+              onStep={(d) => startShadow(Math.max(0, Math.min(tx.sentences.length - 1, shadow.i + d)))}
+            />
+          )}
         </View>
       </View>
 
@@ -667,6 +781,113 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, todaySec, onBack }) {
 // that track with our sentences by time was tried four ways and failed four ways. The desktop now
 // translates each sentence itself (ZH_SYSTEM in prompts.js) and files the result index-aligned
 // with the sentences, so this is a lookup, not a guess. It changes when `cur` does.
+// Seek a little before the chunk so an interpolated start sitting on the first word does not
+// clip it, and let it run a beat past the end so the last word is not cut off.
+// ponytail: fixed margins on interpolated boundaries plus a 250ms poll, so a pause can land up to
+// ~0.4s into the next sentence; if that sliver gives the next line away, pause on word timings.
+const SHADOW_LEAD = 0.3;
+const SHADOW_TAIL = 0.15;
+
+// The 跟讀 loop. Covers the transcript (opaque) so the text cannot be read while recalling — the
+// whole point of advanced shadowing is saying the sentence from memory, not reading it.
+function ShadowPanel({ shadow, words, zh, done, last, onReplay, onReveal, onToggle, onFull, onRecord, onMerge, onStep }) {
+  const { phase, missed } = shadow;
+  const wordCount = words.reduce((a, w) => a + w.word.split(/\s+/).length, 0);
+  const Btn = ({ label, onPress, primary, disabled }) => (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      style={[S.btn, { flex: 1, paddingVertical: 11 }, primary && S.primary, disabled && { opacity: 0.4 }]}
+    >
+      <Text style={[S.btnText, { fontSize: 14 }, primary && S.primaryText]}>{label}</Text>
+    </Pressable>
+  );
+  return (
+    <View style={{ position: "absolute", left: 0, right: 0, top: 0, bottom: 0, backgroundColor: C.bg, padding: 16 }}>
+      <View style={S.row}>
+        <Pressable onPress={() => onStep(-1)} hitSlop={10} disabled={shadow.i === 0}>
+          <Text style={[S.sub, { fontSize: 13, opacity: shadow.i === 0 ? 0.3 : 1 }]}>‹ 上一句</Text>
+        </Pressable>
+        <Text style={[S.sub, { fontSize: 12 }]}>
+          第 {shadow.i + 1} 句{shadow.n > 1 ? `（合併 ${shadow.n} 句）` : ""} · {wordCount} 字
+        </Text>
+        <Pressable onPress={() => onStep(shadow.n)} hitSlop={10} disabled={last}>
+          <Text style={[S.sub, { fontSize: 13, opacity: last ? 0.3 : 1 }]}>下一句 ›</Text>
+        </Pressable>
+      </View>
+      <Text style={[S.sub, { fontSize: 11, textAlign: "center", marginTop: 4 }]}>
+        本次 {done.n} 句 · 最長完整重現 {done.best} 字
+      </Text>
+
+      <ScrollView style={{ flex: 1, marginTop: 14 }} contentContainerStyle={{ flexGrow: 1, justifyContent: "center" }}>
+        {phase === "play" && (
+          <Text style={{ fontSize: 18, textAlign: "center", color: C.dim }}>🎧 仔細聽…</Text>
+        )}
+        {phase === "recall" && (
+          <View style={{ alignItems: "center" }}>
+            <Text style={{ fontSize: 34 }}>🎙</Text>
+            <Text style={{ fontSize: 17, color: C.text, marginTop: 8, textAlign: "center", lineHeight: 26 }}>
+              不看字幕，憑記憶把這句說出來
+            </Text>
+            <Text style={[S.sub, { marginTop: 6 }]}>說完再按「對答案」</Text>
+          </View>
+        )}
+        {phase === "reveal" && (
+          <View>
+            <Text style={[S.sub, { fontSize: 12, marginBottom: 8 }]}>點選沒說出來的字：</Text>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+              {words.map((w) => (
+                <Pressable
+                  key={w.key}
+                  onPress={() => onToggle(w.key)}
+                  style={{
+                    paddingHorizontal: 8, paddingVertical: 5, borderRadius: 6,
+                    backgroundColor: missed[w.key] ? "#fde2e2" : "#eef3ff",
+                  }}
+                >
+                  <Text
+                    style={{
+                      fontSize: 17,
+                      color: missed[w.key] ? "#c0392b" : C.text,
+                      textDecorationLine: missed[w.key] ? "line-through" : "none",
+                    }}
+                  >
+                    {w.word}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {zh ? <Text style={[S.sub, { fontSize: 14, marginTop: 14, lineHeight: 22 }]}>{zh}</Text> : null}
+          </View>
+        )}
+      </ScrollView>
+
+      <View style={{ gap: 8, marginTop: 12 }}>
+        {phase !== "reveal" && (
+          <View style={{ flexDirection: "row", gap: 8 }}>
+            {/* Never disabled while "play": if the player was paused by hand, or the phone
+                refused to autoplay, the chunk never reaches its end and the loop would be stuck. */}
+            <Btn label="重播" onPress={onReplay} />
+            <Btn label="對答案" onPress={onReveal} primary />
+          </View>
+        )}
+        {phase === "reveal" && (
+          <>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <Btn label="完整重現 ✓" onPress={onFull} primary />
+              <Btn label="記錄並下一句" onPress={onRecord} />
+            </View>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <Btn label="重播" onPress={onReplay} />
+              <Btn label="合併下一句" onPress={onMerge} disabled={last} />
+            </View>
+          </>
+        )}
+      </View>
+    </View>
+  );
+}
+
 function ZhBar({ zh, cur }) {
   const have = Array.isArray(zh) && zh.length > 0;
   return (
