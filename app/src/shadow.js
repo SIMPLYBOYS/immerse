@@ -10,6 +10,21 @@ function chunkOf(sentences, i, n) {
   return { i: a, n: b - a + 1, start: sentences[a].start, end: sentences[b].end };
 }
 
+// How many sentences a chunk starting at `i` should take so it is worth shadowing: at least
+// `min` words, or whatever is left of the transcript. "Yeah." or "Thank you for having us." on its
+// own is not a sentence anyone practises — it was being merged by hand nearly every time.
+const MIN_WORDS = 6;
+const wordsIn = (text) => String(text ?? "").split(/\s+/).filter((w) => /[A-Za-z0-9]/.test(w)).length;
+function autoN(sentences, i, min = MIN_WORDS) {
+  let n = 0;
+  let words = 0;
+  while (i + n < sentences.length && (n === 0 || words < min)) {
+    words += wordsIn(sentences[i + n].text);
+    n += 1;
+  }
+  return Math.max(1, n);
+}
+
 // One attempt, written once and never edited — which is what lets the fold merge these by id
 // alone, with no "newest wins" rule to get wrong. `missed` keeps the words themselves, not
 // positions, because the point of the record is the list of words that would not come out.
@@ -54,4 +69,4 @@ function shadowStats(shadows, now, dayKey) {
   return { today: todayN, total: rows.length, sec, best, missedTop };
 }
 
-if (typeof module !== "undefined") module.exports = { chunkOf, shadowRow, shadowStats };
+if (typeof module !== "undefined") module.exports = { chunkOf, autoN, shadowRow, shadowStats, MIN_WORDS };

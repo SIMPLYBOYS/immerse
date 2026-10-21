@@ -78,5 +78,12 @@ const diffCounts = (folded = {}, mine = {}) => {
 const pruneDeleted = (deleted = {}, now = Date.now(), days = 90) =>
   Object.fromEntries(Object.entries(deleted).filter(([, at]) => at > now - days * 86400000));
 
+// A counter as it stands NOW: everyone else's share from the last pull, plus this device's live
+// share. The folded total still carries this device's contribution as it was at that pull, so
+// that stale share is subtracted before the live one is added — showing the folded value alone
+// is how a review done a minute ago read as "0 today" until the next push-and-pull.
+const liveCounts = (folded = {}, pulledMine = {}, liveMine = {}) =>
+  sumCounts(diffCounts(folded, pulledMine), liveMine);
+
 if (typeof module !== "undefined")
-  module.exports = { foldSnapshots, pruneDeleted, sumCounts, diffCounts };
+  module.exports = { foldSnapshots, pruneDeleted, sumCounts, diffCounts, liveCounts };

@@ -48,7 +48,7 @@ function Home({ deck, onStart, busy, error, onRetry }) {
             <Text style={[S.big, { fontSize: 20, color: C.dim }]}>
               {mins} / {GOAL_MIN}
             </Text>
-            <Text style={S.sub}>今日沉浸分鐘（桌機記錄）</Text>
+            <Text style={S.sub}>今日沉浸分鐘</Text>
           </View>
         </View>
       </View>

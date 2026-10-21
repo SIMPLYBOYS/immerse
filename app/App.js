@@ -7,7 +7,7 @@ import { C, S } from "./src/theme";
 import { loadSettings, saveRecall } from "./src/store";
 import { enableDaily } from "./src/notify";
 import { pull, push } from "./src/cloud";
-import { buildQueue, schedule, dayKey } from "./src/logic";
+import { buildQueue, schedule, dayKey, liveCounts } from "./src/logic";
 import Home from "./src/screens/Home";
 import Card from "./src/screens/Card";
 import Immerse from "./src/screens/Immerse";
@@ -26,6 +26,7 @@ export default function App() {
   // would double every other device's minutes on the next pull, and double them again after that.
   const [ownImm, setOwnImm] = useState({ immersion: 0, immLog: {}, immByVideo: {} });
   const pulledImm = useRef({}); // our contribution as it stood at the last pull, for honest display
+  const pulledLog = useRef({}); // same, for review counts
   const [ownSha, setOwnSha] = useState(null);
   const [busy, setBusy] = useState(true);
   const [err, setErr] = useState(null);
@@ -57,6 +58,7 @@ export default function App() {
       const r = await pull(c.repo, c.token, c.deviceId);
       setDeck(r.deck);
       setOwnLog(r.own?.log ?? {});
+      pulledLog.current = r.own?.log ?? {};
       const mine = {
         immersion: r.own?.immersion ?? 0,
         immLog: r.own?.immLog ?? {},
@@ -199,6 +201,15 @@ export default function App() {
   // Today's immersion across every device. The folded total already contains our contribution as
   // it was at the last pull, so that stale share is removed before the live one is added —
   // otherwise the minutes watched this session would appear twice.
+  // The deck as the screens should show it: the folded counters with this device's stale share
+  // swapped for its live one. Without this, reviews and minutes from this session stayed invisible
+  // on the home and stats screens until the next push-and-pull.
+  const view = deck && {
+    ...deck,
+    log: liveCounts(deck.log, pulledLog.current, ownLog),
+    immLog: liveCounts(deck.immLog, pulledImm.current, ownImm.immLog),
+  };
+
   const todaySec = () => {
     const d = dayKey(Date.now());
     const folded = deck?.immLog?.[d] ?? 0;
@@ -336,7 +347,7 @@ export default function App() {
         />
       );
     if (tab === "library") return <Library deck={deck} onStatus={setStatus} />;
-    if (tab === "stats") return <Stats deck={deck} />;
+    if (tab === "stats") return <Stats deck={view} />;
     if (session) {
       const card = session.queue[session.i];
       return (
@@ -358,7 +369,7 @@ export default function App() {
         />
       );
     }
-    return <Home deck={deck} onStart={start} busy={busy} error={err} onRetry={() => sync(cfg)} />;
+    return <Home deck={view} onStart={start} busy={busy} error={err} onRetry={() => sync(cfg)} />;
   };
 
   return (

@@ -22,7 +22,17 @@ const { listTx, getTx } = require("../cloud");
 const { loadHidden, hideVideo, unhideVideo, loadSplit, saveSplit } = require("../store");
 const { VERSION } = require("../shared/version");
 const { explain } = require("../ai");
-const { chunkOf, shadowRow } = require("../shadow");
+const { chunkOf, autoN, shadowRow } = require("../shadow");
+const {
+  useAudioRecorder, useAudioPlayer, RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync,
+} = require("expo-audio");
+const { dropClip, sweepClips } = require("../clips");
+
+// Speech, not music: mono, 22 kHz, 32 kbps AAC — about 4 KB a second against HIGH_QUALITY's 16,
+// and still clear enough to hear an /s/ or a /θ/. Built on HIGH_QUALITY rather than LOW_QUALITY
+// because LOW_QUALITY records AMR-NB on Android: 8 kHz telephone audio that smears exactly the
+// fricatives one listens back for.
+const TAKE = { ...RecordingPresets.HIGH_QUALITY, numberOfChannels: 1, sampleRate: 22050, bitRate: 32000 };
 
 // Watching, not just reading. The video plays, the line being spoken lights up and scrolls
 // itself, tapping a line jumps the player there, tapping a word explains it in that context.
@@ -296,6 +306,25 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, onShadow, todaySec, onBack
   // after replaying can still report the old position past the chunk's end, which would pause
   // the replay before it started.
   const shadowSeen = useRef(false);
+  // The poll only looks every 250ms, so on its own a pause could land up to a quarter-second
+  // late — on top of the boundary's own estimate. Once the end is closer than one tick away, a
+  // timer is set for the exact moment instead.
+  const shadowTimer = useRef(null);
+  const clearShadowTimer = () => {
+    clearTimeout(shadowTimer.current);
+    shadowTimer.current = null;
+  };
+  useEffect(() => clearShadowTimer, []);
+  // Pause THIS chunk — `sh` is the chunk the timer was set for; if the reader has replayed,
+  // stepped or merged since, the chunk on screen is a different one and must not be cut.
+  const pauseShadow = (sh) => {
+    clearShadowTimer();
+    const c = shadowRef.current;
+    if (!c || c.phase !== "play" || c.start !== sh.start || c.end !== sh.end) return;
+    shadowSeen.current = false;
+    setWant(false);
+    setShadow((x) => (x && x.phase === "play" ? { ...x, phase: x.returnTo ?? "recall" } : x));
+  };
 
   // Turned sideways the screen is short and wide, so stacking the player above the transcript
   // would leave a couple of lines visible under it. Side by side, the video gets a column and the
@@ -394,16 +423,18 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, onShadow, todaySec, onBack
         const sh = shadowRef.current;
         if (sh?.phase === "play") {
           if (t < sh.end) shadowSeen.current = true;
-          else if (shadowSeen.current && t >= sh.end + SHADOW_TAIL) {
-            shadowSeen.current = false;
-            setWant(false);
-            setShadow((c) => (c && c.phase === "play" ? { ...c, phase: "recall" } : c));
+          const left = sh.end + SHADOW_TAIL - t;
+          if (shadowSeen.current) {
+            if (left <= 0) pauseShadow(sh);
+            else if (left <= POLL_S && !shadowTimer.current) {
+              shadowTimer.current = setTimeout(() => pauseShadow(sh), left * 1000);
+            }
           }
         }
       } catch {
         // not ready yet, or gone — the next tick will do
       }
-    }, 250);
+    }, POLL_S * 1000);
     return () => clearInterval(iv);
   }, [playing, tx.sentences, lineTokens]);
 
@@ -506,18 +537,26 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, onShadow, todaySec, onBack
 
   // --- 跟讀 actions ---
   const shadowPlay = (sh) => {
+    clearShadowTimer();
     shadowSeen.current = false;
     player.current?.seekTo(Math.max(0, sh.start - SHADOW_LEAD), true);
     setWant(true);
   };
+  // n omitted: as many sentences as it takes to reach MIN_WORDS (short lines merge forward on
+  // their own). n given: exactly that many — 合併下一句 is the reader asking for more.
   // keepT0: merging the next sentence is the same attempt growing, so its clock keeps running.
-  const startShadow = (i, n = 1, keepT0) => {
-    const sh = { ...chunkOf(tx.sentences, i, n), phase: "play", missed: {}, t0: keepT0 ?? Date.now() };
+  const startShadow = (i, n, keepT0) => {
+    const at = Math.max(0, i);
+    const sh = {
+      ...chunkOf(tx.sentences, at, n ?? autoN(tx.sentences, at)),
+      phase: "play", missed: {}, t0: keepT0 ?? Date.now(),
+    };
     setShadow(sh);
     shadowPlay(sh);
   };
   const toggleShadow = () => {
     if (shadow) {
+      clearShadowTimer();
       setShadow(null);
       setWant(false);
       return;
@@ -740,7 +779,9 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, onShadow, todaySec, onBack
               done={shadowDone}
               last={shadow.i + shadow.n >= tx.sentences.length}
               onReplay={() => {
-                setShadow((c) => ({ ...c, phase: "play" }));
+                // Replaying while checking is "let me hear it again against what I said" — come
+                // back to the check with the marks intact, not to a blank recall.
+                setShadow((c) => ({ ...c, phase: "play", returnTo: c.phase === "reveal" ? "reveal" : "recall" }));
                 shadowPlay(shadow);
               }}
               onReveal={() => {
@@ -783,15 +824,92 @@ function Watch({ tx, cfg, marks, onMark, onImmersion, onShadow, todaySec, onBack
 // with the sentences, so this is a lookup, not a guess. It changes when `cur` does.
 // Seek a little before the chunk so an interpolated start sitting on the first word does not
 // clip it, and let it run a beat past the end so the last word is not cut off.
-// ponytail: fixed margins on interpolated boundaries plus a 250ms poll, so a pause can land up to
-// ~0.4s into the next sentence; if that sliver gives the next line away, pause on word timings.
+// ponytail: fixed margins on interpolated sentence boundaries — the timer removes the poll's lag,
+// but a boundary estimated a little late still lets a sliver of the next line through. Pausing on
+// real per-word timings (tOffsetMs) would remove that too.
 const SHADOW_LEAD = 0.3;
 const SHADOW_TAIL = 0.15;
+const POLL_S = 0.25; // the screen's clock interval, in seconds — see the single poll loop
 
 // The 跟讀 loop. Covers the transcript (opaque) so the text cannot be read while recalling — the
 // whole point of advanced shadowing is saying the sentence from memory, not reading it.
 function ShadowPanel({ shadow, words, zh, done, last, onReplay, onReveal, onToggle, onFull, onRecord, onMerge, onStep }) {
   const { phase, missed } = shadow;
+
+  // Record yourself, then hear yourself against the original. Ticking missed words catches what
+  // did not come out; it cannot catch HOW it came out — the vowel, the linking, the stress — and
+  // that only shows up by listening back. The clip lives in the cache and is never uploaded.
+  const recorder = useAudioRecorder(TAKE);
+  const mine = useAudioPlayer(null); // one player, re-pointed after each take (see stopRec)
+  const [rec, setRec] = useState(false);
+  const recRef = useRef(false);
+  recRef.current = rec;
+  const [hasClip, setHasClip] = useState(false);
+  const [micErr, setMicErr] = useState(null);
+  // The file of the take on screen. Every recording is a new file, and nothing else deletes them,
+  // so each one is dropped the moment it stops being the take being compared.
+  const clipUri = useRef(null);
+  const dropCurrent = () => {
+    dropClip(clipUri.current);
+    clipUri.current = null;
+  };
+  // Opening the panel clears anything a killed session (or an older build) left behind.
+  useEffect(() => {
+    sweepClips(null);
+  }, []);
+  // A take belongs to the chunk it was spoken for; moving on makes it worthless.
+  useEffect(() => {
+    dropCurrent();
+    setHasClip(false);
+    setMicErr(null);
+  }, [shadow.i, shadow.n]);
+  // Leaving the panel mid-take must not leave the microphone open, nor the file behind. A take
+  // still recording finishes writing after stop() resolves, so that one is left to the next sweep.
+  useEffect(
+    () => () => {
+      if (recRef.current) recorder.stop().catch(() => {});
+      else dropCurrent();
+    },
+    [],
+  );
+  const startRec = async () => {
+    setMicErr(null);
+    try {
+      const p = await requestRecordingPermissionsAsync();
+      if (!p.granted) return setMicErr("需要麥克風權限才能錄音——到系統設定開啟後再試。");
+      // iOS only honours this; while it is on, playback is routed to the earpiece, hence the
+      // switch back off in stopRec.
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await recorder.prepareToRecordAsync();
+      recorder.record();
+      setRec(true);
+    } catch (e) {
+      setMicErr(`錄音失敗：${e?.message ?? e}`);
+    }
+  };
+  const stopRec = async () => {
+    try {
+      await recorder.stop();
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+      // replace(), not a new source prop: if the recorder reuses one file path, a changed prop
+      // would look identical and the player would keep playing the previous take.
+      if (recorder.uri) {
+        mine.replace({ uri: recorder.uri });
+        // The player has moved on to the new take, so the old file can go. Never the new one:
+        // a recorder that reused a path would otherwise delete what was just recorded.
+        if (clipUri.current && clipUri.current !== recorder.uri) dropClip(clipUri.current);
+        clipUri.current = recorder.uri;
+        setHasClip(true);
+      }
+    } catch (e) {
+      setMicErr(`停止錄音失敗：${e?.message ?? e}`);
+    }
+    setRec(false);
+  };
+  const playMine = () => {
+    mine.seekTo(0);
+    mine.play();
+  };
   const wordCount = words.reduce((a, w) => a + w.word.split(/\s+/).length, 0);
   const Btn = ({ label, onPress, primary, disabled }) => (
     <Pressable
@@ -863,7 +981,18 @@ function ShadowPanel({ shadow, words, zh, done, last, onReplay, onReveal, onTogg
       </ScrollView>
 
       <View style={{ gap: 8, marginTop: 12 }}>
-        {phase !== "reveal" && (
+        {micErr ? <Text style={{ color: C.amber, fontSize: 12 }}>{micErr}</Text> : null}
+        {phase !== "play" && (
+          <View style={{ flexDirection: "row", gap: 8 }}>
+            {rec ? (
+              <Btn label="■ 停止錄音" onPress={stopRec} primary />
+            ) : (
+              <Btn label={hasClip ? "🎙 重錄" : "🎙 錄我的"} onPress={startRec} />
+            )}
+            <Btn label="▶ 聽我的" onPress={playMine} disabled={!hasClip || rec} />
+          </View>
+        )}
+        {phase !== "reveal" && !rec && (
           <View style={{ flexDirection: "row", gap: 8 }}>
             {/* Never disabled while "play": if the player was paused by hand, or the phone
                 refused to autoplay, the chunk never reaches its end and the loop would be stuck. */}
@@ -871,14 +1000,14 @@ function ShadowPanel({ shadow, words, zh, done, last, onReplay, onReveal, onTogg
             <Btn label="對答案" onPress={onReveal} primary />
           </View>
         )}
-        {phase === "reveal" && (
+        {phase === "reveal" && !rec && (
           <>
             <View style={{ flexDirection: "row", gap: 8 }}>
               <Btn label="完整重現 ✓" onPress={onFull} primary />
               <Btn label="記錄並下一句" onPress={onRecord} />
             </View>
             <View style={{ flexDirection: "row", gap: 8 }}>
-              <Btn label="重播" onPress={onReplay} />
+              <Btn label="▶ 聽原句" onPress={onReplay} />
               <Btn label="合併下一句" onPress={onMerge} disabled={last} />
             </View>
           </>

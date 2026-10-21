@@ -29,7 +29,7 @@ const { schedule, stats, forecast, isDue, recallOf, buildQueue, streakOf, byVide
 const { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches } =
   require("./analytics.js");
 const { searchWords, filterWords, dueLabel, groupWords } = require("./library.js");
-const { foldSnapshots, pruneDeleted, sumCounts, diffCounts } = require("./merge.js");
+const { foldSnapshots, pruneDeleted, sumCounts, diffCounts, liveCounts } = require("./merge.js");
 const { b64 } = require("./app/src/cloud.js");
 
 // --- SM-2 ---
@@ -485,7 +485,17 @@ assert.deepEqual(parseZh(undefined, 0), []);
 
 // --- shadowing (跟讀): chunks, attempt rows, stats, and the fold that syncs them ---
 {
-  const { chunkOf, shadowRow, shadowStats } = require("./app/src/shadow.js");
+  const { chunkOf, autoN, shadowRow, shadowStats } = require("./app/src/shadow.js");
+  // short sentences are merged forward until the chunk has at least 6 words
+  const talk = [
+    { text: ">> Yeah." }, { text: "Thank you for having us." },
+    { text: "So the first thing we built was a model gateway." }, { text: "Okay." },
+  ];
+  assert.equal(autoN(talk, 0), 2);  // "Yeah." (1) + 5 words = 6
+  assert.equal(autoN(talk, 2), 1);  // already 10 words on its own
+  assert.equal(autoN(talk, 3), 1);  // last sentence: nothing to merge, still one
+  assert.equal(autoN(talk, 0, 1), 1);
+  assert.equal(autoN([{ text: ">>" }, { text: "[music]" }], 0), 2); // punctuation-only lines count 0
   const sents = [{ start: 0, end: 4 }, { start: 4, end: 9 }, { start: 9, end: 12 }];
   assert.deepEqual(chunkOf(sents, 0, 1), { i: 0, n: 1, start: 0, end: 4 });
   assert.deepEqual(chunkOf(sents, 0, 2), { i: 0, n: 2, start: 0, end: 9 }); // 合併下一句
@@ -517,6 +527,17 @@ assert.deepEqual(parseZh(undefined, 0), []);
   const a = { id: "x1", at: 1 }, b = { id: "x2", at: 2 };
   const folded = foldSnapshots([{ shadows: [a] }, { shadows: [a, b] }, {}]);
   assert.deepEqual(folded.shadows.map((x) => x.id).sort(), ["x1", "x2"]);
+}
+
+// --- liveCounts: reviews done since the last pull show up at once ---
+{
+  // folded at the last pull: desktop 4 + this phone 3 = 7 today. Since then the phone reviewed 5
+  // more (live 8). The home screen must say 12, not the stale 7 — and not 15 (counting 3 twice).
+  assert.deepEqual(liveCounts({ d: 7 }, { d: 3 }, { d: 8 }), { d: 12 });
+  // nothing pulled yet for today, a review just happened
+  assert.deepEqual(liveCounts({}, {}, { d: 1 }), { d: 1 });
+  // other days untouched
+  assert.deepEqual(liveCounts({ y: 5, d: 2 }, { y: 1, d: 2 }, { y: 1, d: 6 }), { y: 5, d: 6 });
 }
 
 // --- replayTarget: S replays the sentence the ear just heard ---
