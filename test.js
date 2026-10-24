@@ -29,7 +29,7 @@ const { schedule, stats, forecast, isDue, recallOf, buildQueue, streakOf, byVide
 const { heatLevel, seriesOf, efficiencyOf, activeDaysOf, addedPerDay, topVideos, leeches } =
   require("./analytics.js");
 const { searchWords, filterWords, dueLabel, groupWords } = require("./library.js");
-const { foldSnapshots, pruneDeleted, sumCounts, diffCounts, liveCounts } = require("./merge.js");
+const { cleanTitle, foldSnapshots, pruneDeleted, sumCounts, diffCounts, liveCounts } = require("./merge.js");
 const { b64 } = require("./app/src/cloud.js");
 
 // --- SM-2 ---
@@ -538,6 +538,10 @@ assert.deepEqual(parseZh(undefined, 0), []);
   assert.deepEqual(liveCounts({}, {}, { d: 1 }), { d: 1 });
   // other days untouched
   assert.deepEqual(liveCounts({ y: 5, d: 2 }, { y: 1, d: 2 }, { y: 1, d: 6 }), { y: 5, d: 6 });
+assert.equal(cleanTitle("(12) Designing CLIs"), "Designing CLIs");
+assert.equal(cleanTitle("(99+) A"), "A");
+assert.equal(cleanTitle("(Live) Talk"), "(Live) Talk"); // a real title starting with brackets stays
+assert.equal(foldSnapshots([{ words: [{ id: "a", title: "(6) T", updatedAt: 1 }] }]).words[0].title, "T");
 }
 
 // --- replayTarget: S replays the sentence the ear just heard ---

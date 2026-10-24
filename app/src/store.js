@@ -105,5 +105,5 @@ async function unhideVideo(id) {
   return next;
 }
 
-module.exports = { loadSettings, saveSettings, saveReminder, saveRecall, loadHidden, hideVideo,
+module.exports = { clean, loadSettings, saveSettings, saveReminder, saveRecall, loadHidden, hideVideo,
   unhideVideo, loadSplit, saveSplit };

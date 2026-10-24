@@ -12,6 +12,11 @@
 //
 // `marks` is deliberately NOT merged — it is derived from the merged rows. One source of truth
 // beats two that can drift apart.
+// YouTube prefixes the tab title with an unread-notification count, "(12) ", and the extension
+// stored it as part of the video name until 3.39.4. Stripped wherever a title is read back, so
+// the rows and transcripts already saved read right without rewriting anyone's file.
+const cleanTitle = (t) => (typeof t === "string" ? t.replace(/^\(\d+\+?\) /, "") : t);
+
 function foldSnapshots(snaps) {
   const rows = new Map();
   const shadows = new Map(); // 跟讀 attempts: written once, never edited, so the id alone merges them
@@ -27,7 +32,7 @@ function foldSnapshots(snaps) {
     for (const w of s.words ?? []) {
       if (!w?.id) continue;
       const cur = rows.get(w.id);
-      if (!cur || (w.updatedAt ?? 0) > (cur.updatedAt ?? 0)) rows.set(w.id, w);
+      if (!cur || (w.updatedAt ?? 0) > (cur.updatedAt ?? 0)) rows.set(w.id, { ...w, title: cleanTitle(w.title) });
     }
     for (const r of s.shadows ?? []) if (r?.id && !shadows.has(r.id)) shadows.set(r.id, r);
     for (const k of ["log", "immLog", "immByVideo"]) {
@@ -86,4 +91,4 @@ const liveCounts = (folded = {}, pulledMine = {}, liveMine = {}) =>
   sumCounts(diffCounts(folded, pulledMine), liveMine);
 
 if (typeof module !== "undefined")
-  module.exports = { foldSnapshots, pruneDeleted, sumCounts, diffCounts, liveCounts };
+  module.exports = { cleanTitle, foldSnapshots, pruneDeleted, sumCounts, diffCounts, liveCounts };

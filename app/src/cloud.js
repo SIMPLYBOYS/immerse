@@ -6,7 +6,7 @@
 // only deck-app-<id>.json and never touches the extension's file, so no upload can lose the
 // other device's work.
 
-const { foldSnapshots } = require("./shared/merge.js");
+const { foldSnapshots, cleanTitle } = require("./shared/merge.js");
 
 const API = "https://api.github.com";
 const DECK_RE = /^deck-.+\.json$/;
@@ -146,7 +146,8 @@ async function listTx(repo, token) {
   if (r) {
     try {
       const idx = JSON.parse(await r.text());
-      if (Object.keys(idx).length) return idx;
+      if (Object.keys(idx).length)
+        return Object.fromEntries(Object.entries(idx).map(([k, m]) => [k, { ...m, title: cleanTitle(m?.title) }]));
     } catch {
       // fall through to the listing
     }
@@ -166,7 +167,8 @@ async function listTx(repo, token) {
 async function getTx(repo, token, videoId) {
   const r = await gh(`/repos/${repo}/contents/tx/${videoId}.json`, { token, ...raw });
   if (!r) throw new Error("找不到這份逐字稿");
-  return JSON.parse(await r.text());
+  const tx = JSON.parse(await r.text());
+  return { ...tx, title: cleanTitle(tx.title) };
 }
 
 // Turns a bare "Bad credentials" into facts. It asks the endpoint we actually use — the repo

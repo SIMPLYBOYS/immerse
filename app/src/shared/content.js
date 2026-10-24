@@ -496,10 +496,13 @@ function start_() {
   // are still on this video, which the caller's stale() check plus this live URL re-check confirm
   // (the re-check also closes the gap where the URL has already changed but the new load's
   // timedtext has not yet fired, so state.trackUrl still points here).
+  // The tab title, minus " - YouTube" and the "(10) " unread-notification count YouTube puts in
+  // front — which otherwise ends up in the stored title and on the phone.
+  const pageTitle = () => document.title.replace(/^\(\d+\+?\) /, "").replace(/ - YouTube$/, "");
   async function saveTranscript(videoId) {
     if (!videoId || !state.sentences.length) return;
     if (new URLSearchParams(location.search).get("v") !== videoId) return;
-    let title = document.title.replace(/ - YouTube$/, "");
+    let title = pageTitle();
     if (!title || title === "YouTube") title = videoId; // never store the placeholder as a name
     // Fetch the Chinese track even when the Z line was never switched on. It is YouTube's own
     // translation of the same URL, so it costs nothing, and it is the last chance to get it: the
@@ -865,7 +868,7 @@ function start_() {
         sentence: item.sentence,
         zh: item.zh,
         videoId: item.videoId,
-        title: document.title.replace(/ - YouTube$/, ""),
+        title: pageTitle(),
         t: item.t,
         suspended: how === "known", // 已掌握 stays in the library but off the review queue
         knownAt: how === "known" ? Date.now() : undefined, // for the "mastered this week" count
@@ -949,7 +952,7 @@ function start_() {
       }
       lines = state.sentences.map((s, i) => `${s.text}\n${state.zh[i] || zhFor(state.zhCues, s)}`);
     }
-    const title = document.title.replace(/ - YouTube$/, "");
+    const title = pageTitle();
     const vid = new URLSearchParams(location.search).get("v");
     const text = `${title}\nhttps://youtu.be/${vid}\n\n${lines.join(state.zhOn ? "\n\n" : "\n")}`;
     try {

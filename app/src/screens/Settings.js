@@ -2,7 +2,7 @@ const React = require("react");
 const { useState } = React;
 const { View, Text, TextInput, Pressable, ScrollView, Switch } = require("react-native");
 const { C, S } = require("../theme");
-const { saveSettings, saveReminder } = require("../store");
+const { saveSettings, saveReminder, clean } = require("../store");
 const { enableDaily, disableDaily } = require("../notify");
 const { testAccess } = require("../cloud");
 
@@ -48,7 +48,6 @@ function Settings({ cfg, onSaved, onSync, status, busy }) {
     setApiKey("");
     setMsg("已儲存");
     // Same cleaning as the store, or this session would keep using the raw pasted value.
-    const clean = (x) => String(x ?? "").replace(/\s+/g, "");
     onSaved({
       ...cfg,
       repo: clean(repo),
@@ -107,10 +106,11 @@ function Settings({ cfg, onSaved, onSync, status, busy }) {
           style={[S.btn, { marginTop: 8 }]}
           onPress={async () => {
             setTmsg("測試中…");
-            // The saved values, not what is typed — the boxes are blank on every visit, and the
-            // question being asked is whether what is STORED works.
-            const r = await testAccess(repo.trim() || cfg.repo, cfg.token);
-            setTmsg(r.msg);
+            // A token typed but not yet saved is the one being asked about — testing the stored
+            // one instead made a fresh token look broken. Blank box: test what is stored.
+            const typed = clean(token);
+            const r = await testAccess(clean(repo) || cfg.repo, typed || cfg.token);
+            setTmsg(`${typed ? "測試剛輸入的 token（尚未儲存）" : "測試已儲存的 token"}：${r.msg}`);
           }}
         >
           <Text style={S.btnText}>測試連線</Text>
